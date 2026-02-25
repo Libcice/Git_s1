@@ -1,0 +1,39 @@
+# --- QMIX specific parameters ---
+# --- belief -----
+belief_dim: 32
+belief_hidden_dim: 32
+belief_lr: 0.0005
+
+MT_traj_length: 50          # 先设安全值
+use_MT_mode: true
+use_mt_pretrain: true
+mt_pretrain_steps: 2000000
+# use epsilon greedy action selector
+action_selector: "epsilon_greedy"
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 50000
+mac: "MAE_mac" 
+
+runner: "episode"
+
+buffer_size: 5000
+
+# update the target network every {} episodes
+target_update_interval: 200
+
+# use the Q_Learner to train
+agent_output_type: "q"
+learner: "q_belief_mae"
+double_q: True
+mixer: "qmix"
+mixing_embed_dim: 32
+hypernet_layers: 2
+hypernet_embed: 64
+agent: "MAEAgent"
+
+use_belief_reg: True
+belief_reg_k: 5
+belief_reg_coef: 1
+
+name: "qmix_belief_mae"
