@@ -74,62 +74,12 @@ class BasicMAC:
 
         return agent_outs.view(ep_batch.batch_size, self.n_agents, -1)
 
-    # # 原始初始化隐藏函数
-    # def init_hidden(self, batch_size):
-    #     if self.args.agent not in ['updet', 'transformer']:
-    #         self.hidden_states = self.agent.init_hidden().unsqueeze(0).expand(batch_size, self.n_agents, -1)  # bav
-    #     else:
-    #         self.hidden_states = self.agent.init_hidden().unsqueeze(0).expand(batch_size, self.n_agents, 1, -1)
-
-    # # 信念 初始化隐藏函数
-    # def init_hidden(self, batch_size):
-    #     # ① 先让 agent 生成初始隐状态（可能是 tuple 也可能是单张量）
-    #     init_h = self.agent.init_hidden()  # 可能是 tensor 也可能是 (h_drqn, h_belief)
-
-    #     # ② 统一转成 tuple（单张量也包一层，方便后面统一处理）
-    #     if not isinstance(init_h, tuple):
-    #         init_h = (init_h,)
-
-    #     # ③ 对 tuple 里每个 h 做 expand
-    #     expanded = []
-    #     for h in init_h:
-    #         if self.args.agent in ['updet', 'transformer']:
-    #             # transformer 类需要多一个维度
-    #             h = h.unsqueeze(0).expand(batch_size, self.n_agents, 1, -1)
-    #         else:
-    #             # 普通 RNN / belief
-    #             h = h.unsqueeze(0).expand(batch_size, self.n_agents, -1)
-    #         expanded.append(h)
-
-    #     # ④ 返回 tuple（与原 agent.forward 签名一致）
-    #     self.hidden_states = tuple(expanded)
+    # 原始初始化隐藏函数
     def init_hidden(self, batch_size):
-        # ① 先让 agent 生成初始隐状态
-        init_h = self.agent.init_hidden()  # 可能是 tensor 也可能是 (h_drqn, h_belief)
-
-        # ② 检查是否是信念智能体
-        is_belief_agent = hasattr(self.agent, 'belief_net') or self.args.agent == 'belief_rnn'
-        
-        if not is_belief_agent:
-            # 标准RNN智能体 - 返回单个张量
-            if self.args.agent in ['updet', 'transformer']:
-                self.hidden_states = init_h.unsqueeze(0).expand(batch_size, self.n_agents, 1, -1)
-            else:
-                self.hidden_states = init_h.unsqueeze(0).expand(batch_size, self.n_agents, -1)
+        if self.args.agent not in ['updet', 'transformer']:
+            self.hidden_states = self.agent.init_hidden().unsqueeze(0).expand(batch_size, self.n_agents, -1)  # bav
         else:
-            # 信念智能体 - 返回元组
-            if not isinstance(init_h, tuple):
-                init_h = (init_h,)
-            
-            expanded = []
-            for h in init_h:
-                if self.args.agent in ['updet', 'transformer']:
-                    h = h.unsqueeze(0).expand(batch_size, self.n_agents, 1, -1)
-                else:
-                    h = h.unsqueeze(0).expand(batch_size, self.n_agents, -1)
-                expanded.append(h)
-            
-            self.hidden_states = tuple(expanded)
+            self.hidden_states = self.agent.init_hidden().unsqueeze(0).expand(batch_size, self.n_agents, 1, -1)
 
     def get_agent_h(self):
         return self.h
