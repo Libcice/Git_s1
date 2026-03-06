@@ -9,6 +9,9 @@ REGISTRY["belief_rnn"] = BeliefRNNAgent
 from .rnn_agent import RNNAgent
 REGISTRY["rnn"] = RNNAgent
 
+# from .transformer_rnn_agent import TransformerRNNAgent
+# REGISTRY["transformer_rnn"] = TransformerRNNAgent
+
 from .updet_agent import UPDeT
 REGISTRY['updet'] = UPDeT
 
@@ -24,3 +27,6 @@ REGISTRY["rtcs"] = HistoryRTCs
 from .rnn_sd_agent import RNN_SD_Agent
 REGISTRY["rnn_sd"] = RNN_SD_Agent
 
+
+from .transformer_belief_agent import TransformerBeliefAgent
+REGISTRY["transformer_belief"] = TransformerBeliefAgent

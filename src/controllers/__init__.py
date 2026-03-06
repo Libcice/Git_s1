@@ -10,3 +10,5 @@ REGISTRY["policy"] = PolicyMAC
 REGISTRY["basic_central_mac"] = CentralBasicMAC
 REGISTRY["belief_mac"] = BeliefMAC
 REGISTRY["MAE_mac"] = MAEMAC
+from .basic_controller_transformer_belief import BasicMACTransformerBelief
+REGISTRY["basic_mac_transformer_belief"] = BasicMACTransformerBelief

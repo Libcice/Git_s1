@@ -36,3 +36,5 @@ REGISTRY["qamix_learner"] = QamixLearner
 REGISTRY["cds_learner"] = CDS_Learner
 REGISTRY["dvd_learner"] = DVDLearner
 REGISTRY["qnam_learner"] = QNAM_Learner
+from .q_learner_transformer_belief import QLearnerTransformerBelief
+REGISTRY["q_learner_transformer_belief"] = QLearnerTransformerBelief
