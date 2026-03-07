@@ -80,12 +80,15 @@ def run(_run, _config, _log):
     except:
         map_name = _config["env_args"]["key"]   
 
-    if map_name not in map_dict:
-        print("the map is not in the dict")
-        return 
-    else:
-        args.ally_num = map_dict[map_name]["ally_num"]
-        args.enemy_num = map_dict[map_name]["enemy_num"]
+    # ally_num 和 enemy_num 已经在 main.py 中设置，这里直接使用
+    # 如果未设置（旧版本兼容），则从 map_dict 获取
+    if not hasattr(args, 'ally_num') or not hasattr(args, 'enemy_num'):
+        if map_name not in map_dict:
+            print("the map is not in the dict")
+            return 
+        else:
+            args.ally_num = map_dict[map_name]["ally_num"]
+            args.enemy_num = map_dict[map_name]["enemy_num"]
         
     alg_name = _config["name"]
     # configure tensorboard logger
