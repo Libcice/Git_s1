@@ -38,3 +38,5 @@ REGISTRY["dvd_learner"] = DVDLearner
 REGISTRY["qnam_learner"] = QNAM_Learner
 from .q_learner_transformer_belief import QLearnerTransformerBelief
 REGISTRY["q_learner_transformer_belief"] = QLearnerTransformerBelief
+from .q_learner_history_token_belief import QLearnerHistoryTokenBelief
+REGISTRY["q_learner_history_token_belief"] = QLearnerHistoryTokenBelief

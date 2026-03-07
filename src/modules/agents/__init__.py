@@ -30,3 +30,5 @@ REGISTRY["rnn_sd"] = RNN_SD_Agent
 
 from .transformer_belief_agent import TransformerBeliefAgent
 REGISTRY["transformer_belief"] = TransformerBeliefAgent
+from .history_token_transformer_belief_agent import HistoryTokenTransformerBeliefAgent
+REGISTRY["history_token_transformer_belief"] = HistoryTokenTransformerBeliefAgent
