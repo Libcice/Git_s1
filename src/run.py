@@ -17,50 +17,37 @@ from components.transforms import OneHot
 
 from smac.env import StarCraft2Env
 
-# 从 main.py 导入地图字典，避免重复定义
-# 注意：当 main.py 导入 run.py 时，MAP_DICT 已经在 main.py 中定义
-# 这里使用延迟导入以避免循环导入问题
-def get_map_dict():
-    """获取地图参数字典，从 main.py 导入"""
-    try:
-        from main import MAP_DICT
-        return MAP_DICT
-    except ImportError:
-        # 如果 main.py 还没有导入（循环导入情况），使用本地定义
-        return {
-            "3m":{"ally_num":3,"enemy_num":3},
-            "8m":{"ally_num":8,"enemy_num":8},
-            "2s3z":{"ally_num":5,"enemy_num":5},
-            "3s5z":{"ally_num":8,"enemy_num":8},
-            "5m_vs_6m":{"ally_num":5,"enemy_num":6},
-            "8m_vs_9m":{"ally_num":8,"enemy_num":9},
-            "10m_vs_11m":{"ally_num":10,"enemy_num":11},
-            "3s5z_vs_3s6z":{"ally_num":8,"enemy_num":9},
-            "2m_vs_1z":{"ally_num":2,"enemy_num":1},
-            "2s_vs_1sc":{"ally_num":2,"enemy_num":1},
-            "3s_vs_3z":{"ally_num":3,"enemy_num":3},
-            "3s_vs_4z":{"ally_num":3,"enemy_num":4},
-            "3s_vs_5z":{"ally_num":3,"enemy_num":5},
-            "6h_vs_8z":{"ally_num":6,"enemy_num":8},
-            "corridor":{"ally_num":6,"enemy_num":24},
-            "2c_vs_64zg":{"ally_num":2,"enemy_num":64},
-            "1c3s5z":{"ally_num":9,"enemy_num":9},
-            "MMM":{"ally_num":10,"enemy_num":10},
-            "MMM2":{"ally_num":10,"enemy_num":12},
-            "7sz":{"ally_num":14,"enemy_num":14},
-            "5s10z":{"ally_num":15,"enemy_num":15},
-            "1c3s5z_vs_1c3s6z":{"ally_num":9,"enemy_num":10},
-            "1c3s8z_vs_1c3s9z":{"ally_num":12,"enemy_num":13},
-            "pp-2":{"ally_num":8,"enemy_num":8},
-            "pp-1":{"ally_num":8,"enemy_num":8},
-            "pp-0.5":{"ally_num":8,"enemy_num":8},
-            "lbf-4-2":{"ally_num":4,"enemy_num":4},
-            "lbf-4-4":{"ally_num":4,"enemy_num":4},
-            "lbf-3-3":{"ally_num":3,"enemy_num":3},
-        }
-
-# 为向后兼容，保留 map_dict 引用
-map_dict = get_map_dict()
+map_dict = {
+    "3m":{"ally_num":3,"enemy_num":3},
+    "8m":{"ally_num":8,"enemy_num":8},
+    "2s3z":{"ally_num":5,"enemy_num":5},
+    "3s5z":{"ally_num":8,"enemy_num":8},
+    "5m_vs_6m":{"ally_num":5,"enemy_num":6},
+    "8m_vs_9m":{"ally_num":8,"enemy_num":9},
+    "10m_vs_11m":{"ally_num":10,"enemy_num":11},
+    "3s5z_vs_3s6z":{"ally_num":8,"enemy_num":9},
+    "2m_vs_1z":{"ally_num":2,"enemy_num":1},
+    "2s_vs_1sc":{"ally_num":2,"enemy_num":1},
+    "3s_vs_3z":{"ally_num":3,"enemy_num":3},
+    "3s_vs_4z":{"ally_num":3,"enemy_num":4},
+    "3s_vs_5z":{"ally_num":3,"enemy_num":5},
+    "6h_vs_8z":{"ally_num":6,"enemy_num":8},
+    "corridor":{"ally_num":6,"enemy_num":24},
+    "2c_vs_64zg":{"ally_num":2,"enemy_num":64},
+    "1c3s5z":{"ally_num":9,"enemy_num":9},
+    "MMM":{"ally_num":10,"enemy_num":10},
+    "MMM2":{"ally_num":10,"enemy_num":12},
+    "7sz":{"ally_num":14,"enemy_num":14},
+    "5s10z":{"ally_num":15,"enemy_num":15},
+    "1c3s5z_vs_1c3s6z":{"ally_num":9,"enemy_num":10},
+    "1c3s8z_vs_1c3s9z":{"ally_num":12,"enemy_num":13},
+    "pp-2":{"ally_num":8,"enemy_num":8},
+    "pp-1":{"ally_num":8,"enemy_num":8},
+    "pp-0.5":{"ally_num":8,"enemy_num":8},
+    "lbf-4-2":{"ally_num":4,"enemy_num":4},
+    "lbf-4-4":{"ally_num":4,"enemy_num":4},
+    "lbf-3-3":{"ally_num":3,"enemy_num":3},
+}
 
 
 def get_agent_own_state_size(env_args):
