@@ -10,16 +10,6 @@ import glob
 import matplotlib.pyplot as plt
 import numpy as np
 from collections import defaultdict
-from scipy.ndimage import uniform_filter1d
-
-
-def smooth_curve(values, window_size=20):
-    """使用移动平均平滑曲线"""
-    if len(values) < window_size:
-        return values
-    # 使用 uniform_filter1d 进行平滑
-    smoothed = uniform_filter1d(values, size=window_size, mode='nearest')
-    return smoothed
 
 
 def get_latest_run(algorithm_dir):
@@ -79,7 +69,7 @@ def load_algorithm_data(base_dir, algorithm_name):
         return None, None
 
 
-def plot_algorithm_comparison(base_dir, output_path=None, smooth_window=20):
+def plot_algorithm_comparison(base_dir, output_path=None):
     """绘制所有算法的对比图"""
     
     # 获取所有算法目录
@@ -90,17 +80,14 @@ def plot_algorithm_comparison(base_dir, output_path=None, smooth_window=20):
     for d in algo_dirs:
         algo_name = os.path.basename(d)
         # 排除非算法目录（如 .git, __pycache__ 等）
-        # 排除包含 'mae' 的算法
-        if (not algo_name.startswith('.') and 
-            not algo_name.startswith('_') and
-            'mae' not in algo_name.lower()):
+        if not algo_name.startswith('.') and not algo_name.startswith('_'):
             algorithms.append(algo_name)
     
     if not algorithms:
         print(f"错误: 在 {base_dir} 中没有找到算法目录")
         return
     
-    print(f"发现 {len(algorithms)} 个算法（已排除 mae）: {algorithms}")
+    print(f"发现 {len(algorithms)} 个算法: {algorithms}")
     
     # 设置图形
     plt.figure(figsize=(14, 8))
@@ -113,18 +100,12 @@ def plot_algorithm_comparison(base_dir, output_path=None, smooth_window=20):
         timesteps, values = load_algorithm_data(base_dir, algo_name)
         
         if timesteps is not None and values is not None:
-            # 平滑曲线
-            smoothed_values = smooth_curve(values, window_size=smooth_window)
-            
-            # 绘制平滑曲线
-            plt.plot(timesteps, smoothed_values, 
+            # 绘制曲线
+            plt.plot(timesteps, values, 
                     label=algo_name, 
                     color=colors[i],
-                    linewidth=2.5,
-                    alpha=0.9)
-            
-            # 可选：绘制原始数据的半透明散点
-            # plt.scatter(timesteps, values, color=colors[i], alpha=0.1, s=5)
+                    linewidth=2,
+                    alpha=0.8)
             
             # 打印统计信息
             print(f"{algo_name}: {len(values)} 个数据点, "
@@ -134,7 +115,7 @@ def plot_algorithm_comparison(base_dir, output_path=None, smooth_window=20):
     # 设置图形属性
     plt.xlabel('Time Steps', fontsize=12)
     plt.ylabel('Test Battle Won Mean', fontsize=12)
-    plt.title('Algorithm Comparison on 6h_vs_8z\nTest Battle Won Mean vs Time Steps (Smoothed)', 
+    plt.title('Algorithm Comparison on 6h_vs_8z\nTest Battle Won Mean vs Time Steps', 
               fontsize=14, fontweight='bold')
     plt.legend(loc='best', fontsize=10)
     plt.grid(True, alpha=0.3)
@@ -151,7 +132,6 @@ def plot_algorithm_comparison(base_dir, output_path=None, smooth_window=20):
     
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     print(f"\n对比图已保存到: {output_path}")
-    print(f"平滑窗口大小: {smooth_window}")
     
     # 显示图形
     plt.show()
@@ -166,5 +146,5 @@ if __name__ == "__main__":
         print(f"错误: 目录不存在 {base_dir}")
         exit(1)
     
-    # 绘制对比图（平滑窗口大小为20）
-    plot_algorithm_comparison(base_dir, smooth_window=20)
+    # 绘制对比图
+    plot_algorithm_comparison(base_dir)
