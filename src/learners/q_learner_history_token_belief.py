@@ -122,11 +122,17 @@ class QLearnerHistoryTokenBelief:
         belief_logvar = belief_logvar_out[:, :-1].clamp(min=self.belief_logvar_min, max=self.belief_logvar_max)
         belief_u = belief_u_out[:, :-1]
 
-        # Predict full state (ally + enemy)
-        state_target = batch["state"][:, :-1].unsqueeze(2).expand(-1, -1, self.args.n_agents, -1)
+        enemy_state = batch["state"][:, :-1, self.ally_state_dim:self.ally_state_dim + self.enemy_state_dim]
+        enemy_state = enemy_state.view(batch.batch_size, -1, self.args.enemy_num, self.enemy_state_feat_dim)
+        state_target = enemy_state.unsqueeze(2).expand(-1, -1, self.args.n_agents, -1, -1)
 
-        # Mask: only compute loss for timesteps and agents that are valid
-        time_agent_mask = mask.unsqueeze(2).expand(-1, -1, self.args.n_agents)
+        enemy_obs_start = self.move_dim
+        enemy_obs_end = enemy_obs_start + self.args.enemy_num * self.enemy_obs_feat_dim
+        enemy_obs = batch["obs"][:, :-1, :, enemy_obs_start:enemy_obs_end]
+        enemy_obs = enemy_obs.view(batch.batch_size, -1, self.args.n_agents, self.args.enemy_num, self.enemy_obs_feat_dim)
+        unseen_mask = (enemy_obs.abs().sum(dim=-1) == 0).float()
+        alive_mask = (state_target[..., 0] > 0).float()
+        belief_mask = unseen_mask * alive_mask
 
         diff = state_target - belief_mu
         d_inv = th.exp(-belief_logvar)
@@ -147,11 +153,15 @@ class QLearnerHistoryTokenBelief:
             raise RuntimeError("Non-positive definite covariance factor encountered in belief NLL")
         logdet = belief_logvar.sum(dim=-1) + logdet_a
         raw_nll = 0.5 * (quad + logdet)
-        nll = raw_nll / float(self.state_shape)
+        nll = raw_nll / float(self.enemy_state_feat_dim)
         nll = nll.clamp(min=0.0, max=self.belief_nll_clip)
 
-        belief_denom = time_agent_mask.sum().clamp(min=1.0)
-        belief_loss = (nll * time_agent_mask).sum() / belief_denom
+        # Handle mask dimensions flexibly: mask can be [B, T, 1] or [B, T, 1, 1]
+        time_agent_mask = mask.unsqueeze(2).expand(-1, -1, self.args.n_agents, -1)
+
+        belief_mask = belief_mask * time_agent_mask
+        belief_denom = belief_mask.sum().clamp(min=1.0)
+        belief_loss = (nll * belief_mask).sum() / belief_denom
         belief_weight = self.belief_loss_coef * min(1.0, float(t_env) / float(max(1, self.belief_warmup_t)))
 
         loss = q_loss + belief_weight * belief_loss

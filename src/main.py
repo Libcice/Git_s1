@@ -27,15 +27,6 @@ results_path = os.path.join(dirname(dirname(abspath(__file__))), "results")
 def my_main(_run, _config, _log):
     # Setting the random seed throughout the modules
     config = config_copy(_config)
-    
-    # 根据地图更新 ally_num 和 enemy_num（在 Sacred 记录 config.json 之前）
-    map_name = config["env_args"].get("map_name") or config["env_args"].get("key")
-    if map_name:
-        from run import map_dict
-        if map_name in map_dict:
-            config["ally_num"] = map_dict[map_name]["ally_num"]
-            config["enemy_num"] = map_dict[map_name]["enemy_num"]
-    
     np.random.seed(config["seed"])
     th.manual_seed(config["seed"])
     config['env_args']['seed'] = config["seed"]

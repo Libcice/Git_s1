@@ -4,31 +4,27 @@ import torch.nn.functional as F
 
 
 class TransformerBeliefAgent(nn.Module):
-    """History-token transformer agent with full-state belief output.
+    """Transformer agent with a Gaussian belief head.
 
-    The input handling follows the history-token path, but the belief head
-    still predicts the full global state instead of only enemy state.
+    Belief covariance is parameterized as:
+        Sigma = diag(exp(logvar)) + U U^T
+    where U has low rank.
     """
 
     def __init__(self, input_shape, args):
         super(TransformerBeliefAgent, self).__init__()
         self.args = args
-        self.token_dim = input_shape
+
         self.hidden_dim = getattr(args, "transformer_hidden_dim", args.rnn_hidden_dim)
         self.n_heads = getattr(args, "transformer_heads", 4)
         self.n_layers = getattr(args, "transformer_layers", 2)
         self.dropout = getattr(args, "transformer_dropout", 0.0)
-        self.history_steps = getattr(args, "history_steps", 4)
-        self.tokens_per_step = args.history_tokens_per_step
-        self.n_enemies = args.enemy_num
         self.belief_lowrank_rank = getattr(args, "belief_lowrank_rank", 4)
 
         if self.hidden_dim % self.n_heads != 0:
             raise ValueError("transformer_hidden_dim must be divisible by transformer_heads")
 
-        self.token_embed = nn.Linear(self.token_dim, self.hidden_dim)
-        self.max_seq_len = 1 + self.history_steps * self.tokens_per_step
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.max_seq_len, self.hidden_dim))
+        self.obs_embed = nn.Linear(input_shape, self.hidden_dim)
 
         layer = nn.TransformerEncoderLayer(
             d_model=self.hidden_dim,
@@ -40,46 +36,34 @@ class TransformerBeliefAgent(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=self.n_layers)
 
+        # Gaussian belief parameters.
         self.belief_mu_head = nn.Linear(self.hidden_dim, args.state_shape)
         self.belief_logvar_head = nn.Linear(self.hidden_dim, args.state_shape)
         self.belief_u_head = nn.Linear(self.hidden_dim, args.state_shape * self.belief_lowrank_rank)
 
-        self.belief_state_proj = nn.Linear(args.state_shape, self.hidden_dim)
-        self.q_head = nn.Linear(self.hidden_dim * 5, args.n_actions)
+        # Q uses fused obs and belief features.
+        self.belief_feat = nn.Linear(args.state_shape, self.hidden_dim)
+        self.q_head = nn.Linear(self.hidden_dim * 2, args.n_actions)
 
     def init_hidden(self):
-        return self.token_embed.weight.new_zeros(1, self.hidden_dim)
+        return self.obs_embed.weight.new_zeros(1, self.hidden_dim)
 
-    def _masked_mean(self, feats, mask):
-        mask = mask.unsqueeze(-1).float()
-        denom = mask.sum(dim=1).clamp(min=1.0)
-        return (feats * mask).sum(dim=1) / denom
+    def forward(self, inputs, hidden_state):
+        # inputs: [batch*n_agents, input_shape]
+        # hidden_state: [batch*n_agents, hidden_dim]
+        obs_feat = F.relu(self.obs_embed(inputs))
+        h_in = hidden_state.reshape(-1, self.hidden_dim)
 
-    def forward(self, history_tokens, current_step, hidden_state):
-        history_emb = F.relu(self.token_embed(history_tokens))
-        h_in = hidden_state.reshape(-1, self.hidden_dim).unsqueeze(1)
+        tokens = torch.stack([obs_feat, h_in], dim=1)
+        encoded = self.encoder(tokens)
 
-        seq = torch.cat([h_in, history_emb], dim=1)
-        seq = seq + self.pos_embed[:, :seq.size(1)]
-        encoded = self.encoder(seq)
+        h = encoded[:, 1, :]
+        belief_mu = self.belief_mu_head(h)
+        belief_logvar = self.belief_logvar_head(h)
+        belief_u = self.belief_u_head(h).view(-1, self.args.state_shape, self.belief_lowrank_rank)
 
-        memory = encoded[:, 0, :]
-        belief_mu = self.belief_mu_head(memory)
-        belief_logvar = self.belief_logvar_head(memory)
-        belief_u = self.belief_u_head(memory).view(-1, self.args.state_shape, self.belief_lowrank_rank)
-
-        move_feat = F.relu(self.token_embed(current_step["move_token"]))
-        self_feat = F.relu(self.token_embed(current_step["self_token"]))
-        visible_enemy_feat = self._masked_mean(
-            F.relu(self.token_embed(current_step["enemy_tokens"])),
-            current_step["enemy_visible"],
-        )
-        belief_feat = F.relu(self.belief_state_proj(belief_mu))
-
-        q_input = torch.cat(
-            [memory, move_feat, self_feat, visible_enemy_feat, belief_feat],
-            dim=-1,
-        )
+        belief_feat = F.relu(self.belief_feat(belief_mu))
+        q_input = torch.cat([obs_feat, belief_feat], dim=-1)
         q = self.q_head(q_input)
 
-        return q, memory, belief_mu, belief_logvar, belief_u
+        return q, h, belief_mu, belief_logvar, belief_u
