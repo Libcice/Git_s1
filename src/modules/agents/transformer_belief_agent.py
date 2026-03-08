@@ -76,8 +76,10 @@ class TransformerBeliefAgent(nn.Module):
         )
         belief_feat = F.relu(self.belief_state_proj(belief_mu))
 
+        # 使用零向量替代belief_feat，保持输入维度一致
+        zero_feat = torch.zeros_like(memory)
         q_input = torch.cat(
-            [memory, move_feat, self_feat, visible_enemy_feat, belief_feat],
+            [memory, move_feat, self_feat, visible_enemy_feat, zero_feat],
             dim=-1,
         )
         q = self.q_head(q_input)
