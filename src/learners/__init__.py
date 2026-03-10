@@ -40,3 +40,6 @@ from .q_learner_transformer_belief import QLearnerTransformerBelief
 REGISTRY["q_learner_transformer_belief"] = QLearnerTransformerBelief
 from .q_learner_history_token_belief import QLearnerHistoryTokenBelief
 REGISTRY["q_learner_history_token_belief"] = QLearnerHistoryTokenBelief
+
+from .q_learner_history_token_rnn_belief import QLearnerHistoryTokenRNNBelief
+REGISTRY["q_learner_history_token_rnn_belief"] = QLearnerHistoryTokenRNNBelief

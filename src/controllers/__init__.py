@@ -14,3 +14,6 @@ from .basic_controller_transformer_belief import BasicMACTransformerBelief
 REGISTRY["basic_mac_transformer_belief"] = BasicMACTransformerBelief
 from .history_token_transformer_belief_controller import HistoryTokenTransformerBeliefMAC
 REGISTRY["history_token_transformer_belief_mac"] = HistoryTokenTransformerBeliefMAC
+
+from .history_token_rnn_belief_controller import HistoryTokenRNNBeliefMAC
+REGISTRY["history_token_rnn_belief_mac"] = HistoryTokenRNNBeliefMAC
