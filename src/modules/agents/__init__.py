@@ -35,3 +35,6 @@ REGISTRY["history_token_transformer_belief"] = HistoryTokenTransformerBeliefAgen
 
 from .history_token_rnn_belief_agent import HistoryTokenRNNBeliefAgent
 REGISTRY["history_token_rnn_belief"] = HistoryTokenRNNBeliefAgent
+
+from .enemy_history_transformer_belief_agent import EnemyHistoryTransformerBeliefAgent
+REGISTRY["enemy_history_transformer_belief"] = EnemyHistoryTransformerBeliefAgent

@@ -6,7 +6,7 @@ import torch as th
 from torch.optim import RMSprop
 
 
-class QLearnerHistoryTokenBelief:
+class QLearnerEnemyHistoryBelief:
     """QMIX learner with belief supervision on unseen enemy state only."""
 
     def __init__(self, mac, scheme, logger, args):

@@ -17,3 +17,6 @@ REGISTRY["history_token_transformer_belief_mac"] = HistoryTokenTransformerBelief
 
 from .history_token_rnn_belief_controller import HistoryTokenRNNBeliefMAC
 REGISTRY["history_token_rnn_belief_mac"] = HistoryTokenRNNBeliefMAC
+
+from .enemy_history_transformer_belief_controller import EnemyHistoryTransformerBeliefMAC
+REGISTRY["enemy_history_transformer_belief_mac"] = EnemyHistoryTransformerBeliefMAC

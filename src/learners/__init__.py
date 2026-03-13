@@ -43,3 +43,6 @@ REGISTRY["q_learner_history_token_belief"] = QLearnerHistoryTokenBelief
 
 from .q_learner_history_token_rnn_belief import QLearnerHistoryTokenRNNBelief
 REGISTRY["q_learner_history_token_rnn_belief"] = QLearnerHistoryTokenRNNBelief
+
+from .q_learner_enemy_history_belief import QLearnerEnemyHistoryBelief
+REGISTRY["q_learner_enemy_history_belief"] = QLearnerEnemyHistoryBelief
