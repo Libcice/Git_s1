@@ -133,13 +133,20 @@ class QLearnerHistoryTokenBelief:
 
         target_mac_out = []
         self.target_mac.init_hidden(batch.batch_size)
-        for t in range(batch.max_seq_length):
-            target_agent_outs = self.target_mac.forward(batch, t=t)
-            target_mac_out.append(target_agent_outs)
+        # 改动前（无 no_grad）：
+        # for t in range(batch.max_seq_length):
+        #     target_agent_outs = self.target_mac.forward(batch, t=t)
+        #     target_mac_out.append(target_agent_outs)
+        # 目标网络仅用于构造 bootstrap target，不需要保存反向图。
+        with th.no_grad():
+            for t in range(batch.max_seq_length):
+                target_agent_outs = self.target_mac.forward(batch, t=t)
+                target_mac_out.append(target_agent_outs)
         target_mac_out = th.stack(target_mac_out[1:], dim=1)
         target_mac_out[avail_actions[:, 1:] == 0] = -9999999
 
         if self.args.double_q:
+            # 使用 clone + detach：避免原地掩码影响 mac_out 主分支的计算图与取值。
             mac_out_detach = mac_out.clone().detach()
             mac_out_detach[avail_actions == 0] = -9999999
             cur_max_actions = mac_out_detach[:, 1:].max(dim=3, keepdim=True)[1]
@@ -149,7 +156,11 @@ class QLearnerHistoryTokenBelief:
 
         if self.mixer is not None:
             chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1])
-            target_max_qvals = self.target_mixer(target_max_qvals, batch["state"][:, 1:])
+            # 改动前（无 no_grad）：
+            # target_max_qvals = self.target_mixer(target_max_qvals, batch["state"][:, 1:])
+            # target_mixer 仅用于目标值估计，不参与梯度更新。
+            with th.no_grad():
+                target_max_qvals = self.target_mixer(target_max_qvals, batch["state"][:, 1:])
 
         N = getattr(self.args, "n_step", 1)
         if N == 1:

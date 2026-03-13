@@ -25,6 +25,7 @@ transformer_heads: 4
 transformer_layers: 2
 transformer_dropout: 0.0
 history_steps: 3
+enemy_history_latents: 8
 
 belief_loss_coef: 0.001
 belief_logvar_min: -2.0
