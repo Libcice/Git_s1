@@ -113,6 +113,9 @@ class HistoryTokenTransformerBeliefMAC:
             "enemy_tokens": self._pad_tokens(enemy).reshape(bs * self.n_agents, self.args.enemy_num, -1),
             # Enemy rows are zero when the unit is outside sight or dead.
             "enemy_visible": (enemy.abs().sum(dim=-1) > 0).reshape(bs * self.n_agents, self.args.enemy_num).float(),
+            # 当前步友军特征直连给 q_head，避免完全依赖 memory 压缩协同信息。
+            "ally_tokens": self._pad_tokens(ally).reshape(bs * self.n_agents, self.n_agents - 1, -1),
+            "ally_visible": (ally.abs().sum(dim=-1) > 0).reshape(bs * self.n_agents, self.n_agents - 1).float(),
         }
         return step_tokens, current
 

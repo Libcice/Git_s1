@@ -53,7 +53,7 @@ class HistoryTokenTransformerBeliefAgent(nn.Module):
         )
 
         self.belief_enemy_proj = nn.Linear(self.enemy_state_feat_dim, self.hidden_dim)
-        self.q_head = nn.Linear(self.hidden_dim * 5, args.n_actions)
+        self.q_head = nn.Linear(self.hidden_dim * 6, args.n_actions)
 
     def init_hidden(self):
         return self.token_embed.weight.new_zeros(1, self.hidden_dim)
@@ -87,6 +87,10 @@ class HistoryTokenTransformerBeliefAgent(nn.Module):
 
         move_feat = F.relu(self.token_embed(current_step["move_token"]))
         self_feat = F.relu(self.token_embed(current_step["self_token"]))
+        ally_feat = self._masked_mean(
+            F.relu(self.token_embed(current_step["ally_tokens"])),
+            current_step["ally_visible"],
+        )
         visible_enemy_feat = self._masked_mean(
             F.relu(self.token_embed(current_step["enemy_tokens"])),
             current_step["enemy_visible"],
@@ -97,7 +101,7 @@ class HistoryTokenTransformerBeliefAgent(nn.Module):
         )
 
         q_input = torch.cat(
-            [memory, move_feat, self_feat, visible_enemy_feat, unseen_enemy_feat],
+            [memory, move_feat, self_feat, ally_feat, visible_enemy_feat, unseen_enemy_feat],
             dim=-1,
         )
         q = self.q_head(q_input)
