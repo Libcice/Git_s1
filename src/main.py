@@ -11,8 +11,6 @@ import torch as th
 from utils.logging import get_logger
 import yaml
 
-from run import run
-
 SETTINGS['CAPTURE_MODE'] = "fd" # set to "no" if you want to see stdout/stderr in console
 logger = get_logger()
 
@@ -41,7 +39,14 @@ def my_main(_run, _config, _log):
     config['env_args']['seed'] = config["seed"]
 
     # run the framework
-    run(_run, config, _log)
+    if config.get("use_onpolicy_mappo_belief", False):
+        from run_mappo_belief import run as selected_run
+    elif config.get("use_onpolicy_mappo", False):
+        from run_mappo_onpolicy import run as selected_run
+    else:
+        from run import run as selected_run
+
+    selected_run(_run, config, _log)
 
 
 def _get_config(params, arg_name, subfolder):
@@ -125,4 +130,3 @@ if __name__ == '__main__':
     ex.observers.append(FileStorageObserver.create(file_obs_path))
 
     ex.run_commandline(params)
-

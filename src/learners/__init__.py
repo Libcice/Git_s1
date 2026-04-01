@@ -41,8 +41,14 @@ REGISTRY["q_learner_transformer_belief"] = QLearnerTransformerBelief
 from .q_learner_history_token_belief import QLearnerHistoryTokenBelief
 REGISTRY["q_learner_history_token_belief"] = QLearnerHistoryTokenBelief
 
+from .q_learner_token_belief import QLearnerTokenBelief
+REGISTRY["q_learner_token_belief"] = QLearnerTokenBelief
+
 from .q_learner_history_token_rnn_belief import QLearnerHistoryTokenRNNBelief
 REGISTRY["q_learner_history_token_rnn_belief"] = QLearnerHistoryTokenRNNBelief
 
 from .q_learner_enemy_history_belief import QLearnerEnemyHistoryBelief
 REGISTRY["q_learner_enemy_history_belief"] = QLearnerEnemyHistoryBelief
+from .q_learner_belief_slot_transformer import QLearnerBeliefSlotTransformer
+REGISTRY["q_learner_belief_slot_transformer"] = QLearnerBeliefSlotTransformer
+

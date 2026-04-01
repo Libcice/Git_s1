@@ -14,9 +14,18 @@ from .basic_controller_transformer_belief import BasicMACTransformerBelief
 REGISTRY["basic_mac_transformer_belief"] = BasicMACTransformerBelief
 from .history_token_transformer_belief_controller import HistoryTokenTransformerBeliefMAC
 REGISTRY["history_token_transformer_belief_mac"] = HistoryTokenTransformerBeliefMAC
+from .token_transformer_belief_controller import TokenTransformerBeliefMAC
+REGISTRY["token_transformer_belief_mac"] = TokenTransformerBeliefMAC
 
 from .history_token_rnn_belief_controller import HistoryTokenRNNBeliefMAC
 REGISTRY["history_token_rnn_belief_mac"] = HistoryTokenRNNBeliefMAC
 
 from .enemy_history_transformer_belief_controller import EnemyHistoryTransformerBeliefMAC
 REGISTRY["enemy_history_transformer_belief_mac"] = EnemyHistoryTransformerBeliefMAC
+from .belief_slot_transformer_controller import BeliefSlotTransformerMAC
+REGISTRY["belief_slot_transformer_mac"] = BeliefSlotTransformerMAC
+
+from .TrXL_belief_controller import TrXLBeliefMAC
+REGISTRY["TrXL_belief_mac"] = TrXLBeliefMAC
+REGISTRY["trxl_belief_mac"] = TrXLBeliefMAC
+

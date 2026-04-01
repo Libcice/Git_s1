@@ -25,6 +25,10 @@ class HistoryTokenTransformerBeliefAgent(nn.Module):
         self.n_enemies = args.enemy_num
         self.enemy_state_feat_dim = args.enemy_state_feat_dim
         self.belief_lowrank_rank = getattr(args, "belief_lowrank_rank", 4)
+        # When belief_loss_coef <= 0, we use this branch as a no-belief ablation.
+        # Keep the belief heads for interface compatibility, but stop feeding
+        # belief-derived unseen-enemy features into q_head.
+        self.disable_belief_for_q = getattr(args, "belief_loss_coef", 0.001) <= 0.0
 
         if self.hidden_dim % self.n_heads != 0:
             raise ValueError("transformer_hidden_dim must be divisible by transformer_heads")
@@ -95,10 +99,15 @@ class HistoryTokenTransformerBeliefAgent(nn.Module):
             F.relu(self.token_embed(current_step["enemy_tokens"])),
             current_step["enemy_visible"],
         )
-        unseen_enemy_feat = self._masked_mean(
-            F.relu(self.belief_enemy_proj(belief_mu)),
-            1.0 - current_step["enemy_visible"].float(),
-        )
+        if self.disable_belief_for_q:
+            # No-belief control: preserve q_head input size while removing
+            # the belief path from action-value computation.
+            unseen_enemy_feat = torch.zeros_like(visible_enemy_feat)
+        else:
+            unseen_enemy_feat = self._masked_mean(
+                F.relu(self.belief_enemy_proj(belief_mu)),
+                1.0 - current_step["enemy_visible"].float(),
+            )
 
         q_input = torch.cat(
             [memory, move_feat, self_feat, ally_feat, visible_enemy_feat, unseen_enemy_feat],

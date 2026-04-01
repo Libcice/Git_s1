@@ -1,0 +1,95 @@
+# --- MAPPO belief transformer ---
+name: "mappo_belief"
+use_onpolicy_mappo_belief: True
+algorithm_name: "rmappo"
+
+agent_output_type: "pi_logits"
+action_selector: "multinomial"
+batch_size_run: 2
+
+lr: 0.00027229
+critic_lr: 0.00077888
+opti_eps: 0.00001
+weight_decay: 0
+
+clip_param: 0.05367104
+ppo_epoch: 10
+num_mini_batch: 1
+data_chunk_length: 10
+entropy_coef: 0.00222254
+value_loss_coef: 1.0
+max_grad_norm: 10
+gamma: 0.99
+gae_lambda: 0.95
+huber_delta: 10.0
+
+hidden_size: 128
+recurrent_N: 1
+use_recurrent_policy: True
+use_naive_recurrent_policy: False
+use_feature_normalization: True
+use_orthogonal: True
+use_ReLU: True
+layer_N: 1
+stacked_frames: 1
+gain: 0.01
+
+use_centralized_V: True
+use_policy_active_masks: True
+use_value_active_masks: True
+use_clipped_value_loss: True
+use_huber_loss: False
+use_valuenorm: True
+use_popart: False
+use_gae: True
+use_proper_time_limits: True
+use_max_grad_norm: True
+
+transformer_heads: 4
+transformer_layers: 2
+transformer_dropout: 0.0
+trxl_impl: "builtin"
+trxl_activation: "relu"
+trxl_norm_first: False
+trxl_final_norm: False
+trxl_ff_mult: 4
+
+belief_loss_coef: 0.001
+belief_logvar_min: -2.0
+belief_logvar_max: 1.0
+belief_lowrank_rank: 3
+belief_nll_clip: 2.0
+belief_warmup_t: 500000
+# Enable the plain-MAPPO-backbone + belief residual actor variant.
+use_residual_belief_actor: False
+# Maximum residual strength added on top of the plain MAPPO actor features.
+belief_residual_alpha: 0.3
+# Set False for the current ungated control experiment; switch back to True to re-enable warmup/confidence gating.
+use_belief_gate: False
+# Enable the detached actor memory context in the critic without changing the actor path.
+use_belief_critic: False
+# Set True to hard-detach belief from the policy path for the whole run.
+detach_belief_to_policy: False
+# When True, start fully detached, then linearly re-enable policy gradients after detach_belief_until_t.
+scheduled_detach_belief: False
+detach_belief_until_t: 1500000
+detach_belief_release_t: 2500000
+# Scale how much belief can directly affect the actor's forward pass.
+belief_policy_alpha: 1.0
+# When True, keep belief out of the actor logits early, then linearly fade it in.
+scheduled_belief_policy: False
+belief_policy_until_t: 0
+belief_policy_release_t: 1500000
+# Warm up belief features before they fully drive the PPO actor.
+belief_gate_warmup_t: 1000000
+# Smaller values make the uncertainty gate sharper; 1.0 keeps it moderate.
+belief_confidence_temp: 2.0
+
+num_env_steps: 4010000
+use_eval: True
+use_linear_lr_decay: False
+n_eval_rollout_threads: 1
+eval_episodes: 32
+eval_interval: 10000
+save_model: False
+local_results_path: "results"

@@ -139,6 +139,11 @@ def run_sequential(args, logger):
     args.n_actions = env_info["n_actions"]
     args.state_shape = env_info["state_shape"]
     args.obs_shape = env_info["obs_shape"]
+    if getattr(args, "is_mappo", False):
+        args.episode_length = env_info["episode_limit"]
+        args.n_rollout_threads = args.batch_size_run
+        args.hidden_size = getattr(args, "hidden_size", args.rnn_hidden_dim)
+        args.algorithm_name = getattr(args, "algorithm_name", "rmappo")
     if 'sc2' in args.env:
         args.unit_dim = runner.env.shield_bits_ally + runner.env.unit_type_bits + 4
     elif 'stag_hunt' in args.env:
@@ -162,6 +167,17 @@ def run_sequential(args, logger):
         "reward": {"vshape": (1,)},
         "terminated": {"vshape": (1,), "dtype": th.uint8},
     }
+    if getattr(args, "is_mappo", False):
+        scheme.update({
+            "action_log_probs": {"vshape": (1,), "group": "agents", "dtype": th.float32},
+            "share_obs": {"vshape": args.state_shape, "group": "agents", "dtype": th.float32},
+            "rnn_states": {"vshape": (args.recurrent_N, args.hidden_size), "group": "agents", "dtype": th.float32},
+            "rnn_states_critic": {"vshape": (args.recurrent_N, args.hidden_size), "group": "agents", "dtype": th.float32},
+            "value_preds": {"vshape": (1,), "group": "agents", "dtype": th.float32},
+            "masks": {"vshape": (1,), "group": "agents", "dtype": th.float32},
+            "active_masks": {"vshape": (1,), "group": "agents", "dtype": th.float32},
+            "bad_masks": {"vshape": (1,), "group": "agents", "dtype": th.float32},
+        })
     groups = {
         "agents": args.n_agents
     }
@@ -183,7 +199,9 @@ def run_sequential(args, logger):
     # Learner
     learner = le_REGISTRY[args.learner](mac, buffer.scheme, logger, args)
     total_mac_params = sum(p.numel() for p in list(mac.agent.parameters()))
-    total_mix_params = sum(p.numel() for p in list(learner.mixer.parameters()))
+    total_mix_params = 0
+    if hasattr(learner, "mixer") and learner.mixer is not None:
+        total_mix_params = sum(p.numel() for p in list(learner.mixer.parameters()))
     print(total_mac_params+total_mix_params)
     print(total_mac_params+total_mix_params)
     print(total_mac_params+total_mix_params)

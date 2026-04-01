@@ -49,6 +49,9 @@ class QLearnerHistoryTokenBelief:
         self.belief_logvar_max = getattr(self.args, "belief_logvar_max", 1.0)
         self.belief_nll_clip = getattr(self.args, "belief_nll_clip", 2.0)
         self.belief_warmup_t = getattr(self.args, "belief_warmup_t", 500000)
+        # belief_loss_coef <= 0 turns this learner into a pure QMIX baseline
+        # while reusing the same history-token MAC for a fair ablation.
+        self.disable_belief_loss = self.belief_loss_coef <= 0.0
         self.log_stats_t = -self.args.learner_log_interval - 1
 
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int):
@@ -77,7 +80,7 @@ class QLearnerHistoryTokenBelief:
             agent_outs = self.mac.forward(batch, t=t)
             mac_out.append(agent_outs)
 
-            if t >= batch.max_seq_length - 1:
+            if self.disable_belief_loss or t >= batch.max_seq_length - 1:
                 continue
 
             belief_mu_t, belief_logvar_t, belief_u_t = self.mac.get_belief_stats()
@@ -181,13 +184,22 @@ class QLearnerHistoryTokenBelief:
         masked_td_error = td_error * q_mask
         q_loss = (masked_td_error ** 2).sum() / q_mask.sum()
 
-        belief_loss = belief_loss_sum / belief_denom.clamp(min=1.0)
-        raw_nll_mean = raw_nll_sum / raw_nll_count.clamp(min=1.0)
-        belief_logvar_mean = belief_logvar_sum / belief_logvar_count.clamp(min=1.0)
-        belief_unseen_frac = belief_mask_sum / belief_mask_count.clamp(min=1.0)
-        belief_weight = self.belief_loss_coef * min(1.0, float(t_env) / float(max(1, self.belief_warmup_t)))
-
-        loss = q_loss + belief_weight * belief_loss
+        if self.disable_belief_loss:
+            # No-belief control: skip the auxiliary belief objective entirely.
+            zero = rewards.new_tensor(0.0)
+            belief_loss = zero
+            raw_nll_mean = zero
+            belief_logvar_mean = zero
+            belief_unseen_frac = zero
+            belief_weight = 0.0
+            loss = q_loss
+        else:
+            belief_loss = belief_loss_sum / belief_denom.clamp(min=1.0)
+            raw_nll_mean = raw_nll_sum / raw_nll_count.clamp(min=1.0)
+            belief_logvar_mean = belief_logvar_sum / belief_logvar_count.clamp(min=1.0)
+            belief_unseen_frac = belief_mask_sum / belief_mask_count.clamp(min=1.0)
+            belief_weight = self.belief_loss_coef * min(1.0, float(t_env) / float(max(1, self.belief_warmup_t)))
+            loss = q_loss + belief_weight * belief_loss
 
         self.optimiser.zero_grad()
         loss.backward()

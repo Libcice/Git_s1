@@ -1,0 +1,270 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from mappo_onpolicy.models.act import ACTLayer
+from mappo_onpolicy.models.actor_critic import R_Critic
+from mappo_onpolicy.models.util import check
+from mappo_belief.models.smac_tokenizer import SMACTokenizer
+from mappo_belief.models.trxl import build_trxl_encoder
+
+
+class BeliefTransformerActor(nn.Module):
+    def __init__(self, args, obs_space, action_space, device=torch.device("cpu")):
+        super().__init__()
+        self.args = args
+        self.hidden_size = args.hidden_size
+        self._gain = args.gain
+        self._use_orthogonal = args.use_orthogonal
+        self._use_policy_active_masks = args.use_policy_active_masks
+        self._recurrent_N = args.recurrent_N
+        self.tpdv = dict(dtype=torch.float32, device=device)
+        self.device = device
+
+        self.tokenizer = SMACTokenizer(args, device)
+        self.layout = self.tokenizer.layout
+        self.token_dim = self.layout.token_dim
+        self.n_enemies = args.enemy_num
+        self.enemy_state_feat_dim = self.layout.enemy_state_feat_dim
+        self.belief_lowrank_rank = getattr(args, "belief_lowrank_rank", 3)
+        self.use_belief_gate = getattr(args, "use_belief_gate", True)
+        self.belief_gate_warmup_t = getattr(args, "belief_gate_warmup_t", getattr(args, "belief_warmup_t", 500000))
+        self.belief_confidence_temp = getattr(args, "belief_confidence_temp", 1.0)
+        self.belief_logvar_min = getattr(args, "belief_logvar_min", -2.0)
+        self.belief_logvar_max = getattr(args, "belief_logvar_max", 1.0)
+
+        self.token_embed = nn.Linear(self.token_dim, self.hidden_size)
+        self.max_seq_len = 1 + self.layout.tokens_per_step
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.max_seq_len, self.hidden_size))
+        self.encoder = build_trxl_encoder(
+            hidden_dim=self.hidden_size,
+            n_heads=getattr(args, "transformer_heads", 4),
+            n_layers=getattr(args, "transformer_layers", 2),
+            dropout=getattr(args, "transformer_dropout", 0.0),
+            activation=getattr(args, "trxl_activation", "relu"),
+            norm_first=getattr(args, "trxl_norm_first", False),
+            final_norm=getattr(args, "trxl_final_norm", False),
+            ff_mult=getattr(args, "trxl_ff_mult", 4),
+            impl=getattr(args, "trxl_impl", "builtin"),
+        )
+
+        belief_out_dim = self.n_enemies * self.enemy_state_feat_dim
+        self.belief_mu_head = nn.Linear(self.hidden_size, belief_out_dim)
+        self.belief_logvar_head = nn.Linear(self.hidden_size, belief_out_dim)
+        self.belief_u_head = nn.Linear(
+            self.hidden_size,
+            belief_out_dim * self.belief_lowrank_rank,
+        )
+
+        self.belief_enemy_proj = nn.Linear(self.enemy_state_feat_dim, self.hidden_size)
+        # Old: flatten every enemy slot before the policy head.
+        # self.policy_in_dim = self.hidden_size * (4 + self.n_enemies)
+        # self.policy_proj = nn.Sequential(
+        #     nn.Linear(self.policy_in_dim, self.hidden_size),
+        #     nn.ReLU(),
+        # )
+        # Old: read visible and unseen enemies as two summary streams.
+        # self.policy_in_dim = self.hidden_size * 6
+        # Collapse all enemy slots into one summary stream again so the actor sees a single fused enemy context.
+        self.policy_in_dim = self.hidden_size * 5
+        self.policy_proj = nn.Sequential(
+            nn.Linear(self.policy_in_dim, self.hidden_size),
+            nn.ReLU(),
+        )
+        self.act = ACTLayer(action_space, self.hidden_size, self._use_orthogonal, self._gain, args)
+        # Track gate progress for logging; when the gate is disabled this buffer stays at 1.0 for a clean control run.
+        self.register_buffer("_belief_gate_alpha", torch.zeros(1, device=device))
+        self.to(device)
+
+    def init_hidden(self):
+        return self.token_embed.weight.new_zeros(1, self.hidden_size)
+
+    def _masked_mean(self, feats, mask):
+        if feats.size(1) == 0:
+            return feats.new_zeros(feats.size(0), feats.size(-1))
+        mask = mask.unsqueeze(-1).float()
+        denom = mask.sum(dim=1).clamp(min=1.0)
+        return (feats * mask).sum(dim=1) / denom
+
+    def set_belief_gate_progress(self, total_num_steps):
+        if not self.use_belief_gate:
+            alpha = 1.0
+        elif self.belief_gate_warmup_t <= 0:
+            alpha = 1.0
+        else:
+            alpha = min(1.0, float(total_num_steps) / float(self.belief_gate_warmup_t))
+        self._belief_gate_alpha.fill_(alpha)
+
+    def get_belief_gate_alpha(self):
+        return float(self._belief_gate_alpha.item())
+
+    def _build_unseen_belief_mask(self, enemy_visible, belief_logvar):
+        # Set use_belief_gate=False to recover the ungated baseline while keeping the rest of the actor unchanged.
+        if not self.use_belief_gate:
+            return 1.0 - enemy_visible
+        belief_logvar = belief_logvar.clamp(min=self.belief_logvar_min, max=self.belief_logvar_max)
+        confidence = torch.sigmoid(-belief_logvar.mean(dim=-1) / max(self.belief_confidence_temp, 1e-6))
+        gate_alpha = self._belief_gate_alpha.to(device=enemy_visible.device, dtype=enemy_visible.dtype)
+        return (1.0 - enemy_visible) * confidence * gate_alpha
+
+    def _encode_step(self, obs, prev_actions, agent_ids, memory):
+        step_tokens, current = self.tokenizer(obs, prev_actions=prev_actions, agent_ids=agent_ids)
+        step_emb = F.relu(self.token_embed(step_tokens))
+
+        seq = torch.cat([memory.unsqueeze(1), step_emb], dim=1)
+        seq = seq + self.pos_embed[:, :seq.size(1)]
+        encoded = self.encoder(seq)
+        new_memory = encoded[:, 0, :]
+
+        belief_mu = self.belief_mu_head(new_memory).view(-1, self.n_enemies, self.enemy_state_feat_dim)
+        belief_logvar = self.belief_logvar_head(new_memory).view(-1, self.n_enemies, self.enemy_state_feat_dim)
+        belief_u = self.belief_u_head(new_memory).view(
+            -1, self.n_enemies, self.enemy_state_feat_dim, self.belief_lowrank_rank
+        )
+
+        move_feat = F.relu(self.token_embed(current["move_token"]))
+        self_feat = F.relu(self.token_embed(current["self_token"]))
+        ally_feat = self._masked_mean(
+            F.relu(self.token_embed(current["ally_tokens"])),
+            current["ally_visible"],
+        )
+        visible_enemy_feat = F.relu(self.token_embed(current["enemy_tokens"]))
+        belief_enemy_feat = F.relu(self.belief_enemy_proj(belief_mu))
+        enemy_visible = current["enemy_visible"].float()
+        # Old: merge all enemies into one long vector.
+        # fused_enemy_feat = enemy_visible.unsqueeze(-1) * visible_enemy_feat + (1.0 - enemy_visible.unsqueeze(-1)) * belief_enemy_feat
+        # enemy_feat = fused_enemy_feat.flatten(start_dim=1)
+        # Old: split visible and unseen enemies into two summary streams.
+        # visible_enemy_summary = self._masked_mean(visible_enemy_feat, enemy_visible)
+        # unseen_belief_mask = self._build_unseen_belief_mask(enemy_visible, belief_logvar)
+        # unseen_enemy_summary = self._masked_mean(belief_enemy_feat, unseen_belief_mask)
+        unseen_belief_mask = self._build_unseen_belief_mask(enemy_visible, belief_logvar)
+        # Keep the belief gate, but fuse all enemy slots back into one weighted mean stream.
+        fused_enemy_feat = (
+            enemy_visible.unsqueeze(-1) * visible_enemy_feat
+            + unseen_belief_mask.unsqueeze(-1) * belief_enemy_feat
+        )
+        enemy_summary_mask = enemy_visible + unseen_belief_mask
+        enemy_summary = self._masked_mean(fused_enemy_feat, enemy_summary_mask)
+
+        actor_features = self.policy_proj(
+            torch.cat(
+                [new_memory, move_feat, self_feat, ally_feat, enemy_summary],
+                dim=-1,
+            )
+        )
+        aux = {
+            "belief_mu": belief_mu,
+            "belief_logvar": belief_logvar,
+            "belief_u": belief_u,
+            "enemy_visible": current["enemy_visible"],
+        }
+        return actor_features, new_memory, aux
+
+    def _encode(self, obs, prev_actions, agent_ids, rnn_states, masks):
+        obs = check(obs).to(**self.tpdv)
+        rnn_states = check(rnn_states).to(**self.tpdv)
+        masks = check(masks).to(**self.tpdv)
+        if prev_actions is not None:
+            prev_actions = check(prev_actions).to(**self.tpdv)
+        if agent_ids is not None:
+            agent_ids = check(agent_ids).to(**self.tpdv)
+
+        # Rollout path: one hidden state per sample.
+        if rnn_states.size(0) == obs.size(0):
+            memory = rnn_states[:, 0, :] * masks
+            actor_features, new_memory, aux = self._encode_step(obs, prev_actions, agent_ids, memory)
+            return actor_features, new_memory.unsqueeze(1), aux
+
+        # Training path: recurrent mini-batches provide initial memory for each chunk.
+        batch_size = rnn_states.size(0)
+        seq_len = obs.size(0) // batch_size
+        obs = obs.view(seq_len, batch_size, -1)
+        masks = masks.view(seq_len, batch_size, -1)
+        if prev_actions is not None:
+            prev_actions = prev_actions.view(seq_len, batch_size, -1)
+        if agent_ids is not None:
+            agent_ids = agent_ids.view(seq_len, batch_size, -1)
+
+        memory = rnn_states[:, 0, :]
+        actor_features = []
+        belief_mu = []
+        belief_logvar = []
+        belief_u = []
+        enemy_visible = []
+
+        for t in range(seq_len):
+            memory = memory * masks[t]
+            step_prev_actions = prev_actions[t] if prev_actions is not None else None
+            step_agent_ids = agent_ids[t] if agent_ids is not None else None
+            step_features, memory, step_aux = self._encode_step(
+                obs[t], step_prev_actions, step_agent_ids, memory
+            )
+            actor_features.append(step_features)
+            belief_mu.append(step_aux["belief_mu"])
+            belief_logvar.append(step_aux["belief_logvar"])
+            belief_u.append(step_aux["belief_u"])
+            enemy_visible.append(step_aux["enemy_visible"])
+
+        actor_features = torch.cat(actor_features, dim=0)
+        aux = {
+            "belief_mu": torch.cat(belief_mu, dim=0),
+            "belief_logvar": torch.cat(belief_logvar, dim=0),
+            "belief_u": torch.cat(belief_u, dim=0),
+            "enemy_visible": torch.cat(enemy_visible, dim=0),
+        }
+        return actor_features, memory.unsqueeze(1), aux
+
+    def forward(
+        self,
+        obs,
+        prev_actions,
+        agent_ids,
+        rnn_states,
+        masks,
+        available_actions=None,
+        deterministic=False,
+        return_aux=False,
+    ):
+        if available_actions is not None:
+            available_actions = check(available_actions).to(**self.tpdv)
+
+        actor_features, new_rnn_states, aux = self._encode(
+            obs, prev_actions, agent_ids, rnn_states, masks
+        )
+        actions, action_log_probs = self.act(actor_features, available_actions, deterministic)
+        if return_aux:
+            return actions, action_log_probs, new_rnn_states, aux
+        return actions, action_log_probs, new_rnn_states
+
+    def evaluate_actions(
+        self,
+        obs,
+        prev_actions,
+        agent_ids,
+        rnn_states,
+        action,
+        masks,
+        available_actions=None,
+        active_masks=None,
+        return_aux=False,
+    ):
+        action = check(action).to(**self.tpdv)
+        if available_actions is not None:
+            available_actions = check(available_actions).to(**self.tpdv)
+        if active_masks is not None:
+            active_masks = check(active_masks).to(**self.tpdv)
+
+        actor_features, _, aux = self._encode(obs, prev_actions, agent_ids, rnn_states, masks)
+        action_log_probs, dist_entropy = self.act.evaluate_actions(
+            actor_features,
+            action,
+            available_actions,
+            active_masks=active_masks if self._use_policy_active_masks else None,
+        )
+        if return_aux:
+            return action_log_probs, dist_entropy, aux
+        return action_log_probs, dist_entropy
+
+
+BeliefCritic = R_Critic

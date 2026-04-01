@@ -113,6 +113,8 @@ class HistoryTokenRNNBeliefMAC:
             "enemy_tokens": self._pad_tokens(enemy).reshape(bs * self.n_agents, self.args.enemy_num, -1),
             # Enemy rows are zero when the unit is outside sight or dead.
             "enemy_visible": (enemy.abs().sum(dim=-1) > 0).reshape(bs * self.n_agents, self.args.enemy_num).float(),
+            "ally_tokens": self._pad_tokens(ally).reshape(bs * self.n_agents, self.n_agents - 1, -1),
+            "ally_visible": (ally.abs().sum(dim=-1) > 0).reshape(bs * self.n_agents, self.n_agents - 1).float(),
         }
         return step_tokens, current
 

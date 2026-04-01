@@ -1,0 +1,384 @@
+import os
+import time
+
+import numpy as np
+import torch
+
+from mappo_belief.buffer import SharedReplayBuffer
+from mappo_belief.env import ParallelSMACEnv
+from mappo_belief.learner import MAPPOLearner
+from mappo_belief.policy import MAPPOBeliefPolicy
+from utils.timehelper import time_left, time_str
+
+
+def _t2n(x):
+    return x.detach().cpu().numpy()
+
+
+class MAPPOBeliefRunner:
+    def __init__(self, args, logger, run_dir):
+        self.args = args
+        self.logger = logger
+        self.run_dir = run_dir
+        self.device = torch.device("cuda" if args.use_cuda and torch.cuda.is_available() else "cpu")
+        self.n_rollout_threads = args.batch_size_run
+        self.n_eval_rollout_threads = getattr(args, "n_eval_rollout_threads", 1)
+        self.eval_episodes = getattr(args, "eval_episodes", getattr(args, "test_nepisode", 32))
+        self.eval_interval = getattr(args, "eval_interval", getattr(args, "test_interval", 10000))
+        self.log_interval = getattr(args, "log_interval", 10000)
+        self.save_interval = getattr(args, "save_model_interval", 2000000)
+        self.num_env_steps = getattr(args, "num_env_steps", getattr(args, "t_max", 0))
+        self.use_eval = getattr(args, "use_eval", True)
+        self.use_linear_lr_decay = getattr(args, "use_linear_lr_decay", False)
+        self.model_dir = os.path.join(run_dir, "models")
+        os.makedirs(self.model_dir, exist_ok=True)
+
+        self.envs = ParallelSMACEnv(args, self.n_rollout_threads, seed_offset=0)
+        self.eval_envs = ParallelSMACEnv(args, self.n_eval_rollout_threads, seed_offset=100000) if self.use_eval else None
+
+        env_info = self.envs.env_info
+        self.num_agents = env_info["n_agents"]
+        self.n_actions = env_info["n_actions"]
+        self.episode_length = env_info["episode_limit"]
+        self.args.n_agents = self.num_agents
+        self.args.n_actions = self.n_actions
+        self.args.state_shape = env_info["state_shape"]
+        self.args.obs_shape = env_info["obs_shape"]
+        self.args.episode_length = self.episode_length
+        self.args.n_rollout_threads = self.n_rollout_threads
+        self.args.n_eval_rollout_threads = self.n_eval_rollout_threads
+        if not hasattr(self.args, "unit_dim"):
+            self.args.unit_dim = 5
+
+        share_obs_space = (
+            self.envs.share_observation_space[0]
+            if self.args.use_centralized_V
+            else self.envs.observation_space[0]
+        )
+
+        self.policy = MAPPOBeliefPolicy(
+            self.args,
+            self.envs.observation_space[0],
+            share_obs_space,
+            self.envs.action_space[0],
+            device=self.device,
+        )
+        self.trainer = MAPPOLearner(self.args, self.policy, device=self.device)
+        self.buffer = SharedReplayBuffer(
+            self.args,
+            self.num_agents,
+            self.envs.observation_space[0],
+            share_obs_space,
+            self.envs.action_space[0],
+        )
+
+        self.total_num_steps = 0
+        self.train_returns = []
+        self.train_wins = []
+        self.train_lengths = []
+        self.train_episode_returns = np.zeros(self.n_rollout_threads, dtype=np.float32)
+        self.train_episode_lengths = np.zeros(self.n_rollout_threads, dtype=np.int32)
+        self.completed_train_episodes = 0
+
+        self.prev_actions = np.zeros(
+            (self.n_rollout_threads, self.num_agents, self.n_actions),
+            dtype=np.float32,
+        )
+        self.agent_ids = np.broadcast_to(
+            np.eye(self.num_agents, dtype=np.float32).reshape(1, self.num_agents, self.num_agents),
+            (self.n_rollout_threads, self.num_agents, self.num_agents),
+        ).copy()
+
+    def _actions_to_onehot(self, actions):
+        action_ids = actions.squeeze(-1).astype(np.int64)
+        onehot = np.zeros((actions.shape[0], actions.shape[1], self.n_actions), dtype=np.float32)
+        rows = np.arange(actions.shape[0])[:, None]
+        cols = np.arange(actions.shape[1])[None, :]
+        onehot[rows, cols, action_ids] = 1.0
+        return onehot
+
+    def warmup(self):
+        obs, share_obs, available_actions = self.envs.reset()
+        if not self.args.use_centralized_V:
+            share_obs = obs.copy()
+        self.buffer.share_obs[0] = share_obs.copy()
+        self.buffer.obs[0] = obs.copy()
+        self.buffer.prev_actions[0] = self.prev_actions.copy()
+        self.buffer.agent_ids[0] = self.agent_ids.copy()
+        self.buffer.available_actions[0] = available_actions.copy()
+
+    def _sync_belief_progress(self, total_num_steps=None):
+        if hasattr(self.policy.actor, "set_belief_gate_progress"):
+            self.policy.actor.set_belief_gate_progress(self.total_num_steps if total_num_steps is None else total_num_steps)
+
+    @torch.no_grad()
+    def collect(self, step):
+        self._sync_belief_progress()
+        self.trainer.prep_rollout()
+        values, actions, action_log_probs, rnn_states, rnn_states_critic = self.policy.get_actions(
+            np.concatenate(self.buffer.share_obs[step]),
+            np.concatenate(self.buffer.obs[step]),
+            np.concatenate(self.buffer.prev_actions[step]),
+            np.concatenate(self.buffer.agent_ids[step]),
+            np.concatenate(self.buffer.rnn_states[step]),
+            np.concatenate(self.buffer.rnn_states_critic[step]),
+            np.concatenate(self.buffer.masks[step]),
+            np.concatenate(self.buffer.available_actions[step]),
+        )
+        values = np.array(np.split(_t2n(values), self.n_rollout_threads))
+        actions = np.array(np.split(_t2n(actions), self.n_rollout_threads))
+        action_log_probs = np.array(np.split(_t2n(action_log_probs), self.n_rollout_threads))
+        rnn_states = np.array(np.split(_t2n(rnn_states), self.n_rollout_threads))
+        rnn_states_critic = np.array(np.split(_t2n(rnn_states_critic), self.n_rollout_threads))
+        return values, actions, action_log_probs, rnn_states, rnn_states_critic
+
+    def insert(self, data):
+        (
+            obs,
+            share_obs,
+            rewards,
+            dones,
+            infos,
+            available_actions,
+            values,
+            actions,
+            action_log_probs,
+            rnn_states,
+            rnn_states_critic,
+        ) = data
+
+        dones_env = np.all(dones, axis=1)
+        next_prev_actions = self._actions_to_onehot(actions)
+
+        if np.any(dones_env):
+            rnn_states[dones_env] = 0.0
+            rnn_states_critic[dones_env] = 0.0
+            next_prev_actions[dones_env] = 0.0
+
+        masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
+        masks[dones_env] = 0.0
+
+        active_masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
+        active_masks[dones] = 0.0
+        active_masks[dones_env] = 1.0
+
+        bad_masks = np.array(
+            [
+                [[0.0] if infos[env_i][agent_i].get("bad_transition", False) else [1.0] for agent_i in range(self.num_agents)]
+                for env_i in range(self.n_rollout_threads)
+            ],
+            dtype=np.float32,
+        )
+
+        if not self.args.use_centralized_V:
+            share_obs = obs.copy()
+
+        self.buffer.insert(
+            share_obs,
+            obs,
+            next_prev_actions,
+            self.agent_ids,
+            rnn_states,
+            rnn_states_critic,
+            actions,
+            action_log_probs,
+            values,
+            rewards,
+            masks,
+            bad_masks,
+            active_masks,
+            available_actions,
+        )
+        self.prev_actions = next_prev_actions
+
+    @torch.no_grad()
+    def compute(self):
+        self._sync_belief_progress()
+        self.trainer.prep_rollout()
+        next_values = self.policy.get_values(
+            np.concatenate(self.buffer.share_obs[-1]),
+            np.concatenate(self.buffer.obs[-1]),
+            np.concatenate(self.buffer.prev_actions[-1]),
+            np.concatenate(self.buffer.agent_ids[-1]),
+            np.concatenate(self.buffer.rnn_states[-1]),
+            np.concatenate(self.buffer.rnn_states_critic[-1]),
+            np.concatenate(self.buffer.masks[-1]),
+        )
+        next_values = np.array(np.split(_t2n(next_values), self.n_rollout_threads))
+        self.buffer.compute_returns(next_values, self.trainer.value_normalizer)
+
+    def train(self):
+        self.trainer.prep_training()
+        train_info = self.trainer.train(self.buffer, self.total_num_steps)
+        self.buffer.after_update()
+        return train_info
+
+    def save(self, total_num_steps):
+        torch.save(self.policy.actor.state_dict(), os.path.join(self.model_dir, f"actor_{total_num_steps}.pt"))
+        torch.save(self.policy.critic.state_dict(), os.path.join(self.model_dir, f"critic_{total_num_steps}.pt"))
+
+    def run(self):
+        self.warmup()
+        start = time.time()
+        last_time = start
+        episodes = max(1, self.num_env_steps // self.episode_length // self.n_rollout_threads)
+        last_log = 0
+        last_eval = 0
+        last_save = 0
+
+        self.logger.console_logger.info("Beginning training for %s timesteps", self.num_env_steps)
+
+        for episode in range(episodes):
+            if self.use_linear_lr_decay:
+                self.policy.lr_decay(episode, episodes)
+
+            for step in range(self.episode_length):
+                values, actions, action_log_probs, rnn_states, rnn_states_critic = self.collect(step)
+                obs, share_obs, rewards, dones, infos, available_actions = self.envs.step(actions)
+
+                self.train_episode_returns += rewards[:, 0, 0]
+                self.train_episode_lengths += 1
+                dones_env = np.all(dones, axis=1)
+                for env_i, done in enumerate(dones_env):
+                    if done:
+                        self.train_returns.append(float(self.train_episode_returns[env_i]))
+                        self.train_lengths.append(int(self.train_episode_lengths[env_i]))
+                        self.train_wins.append(float(infos[env_i][0].get("won", False)))
+                        self.train_episode_returns[env_i] = 0.0
+                        self.train_episode_lengths[env_i] = 0
+                        self.completed_train_episodes += 1
+
+                self.insert(
+                    (
+                        obs,
+                        share_obs,
+                        rewards,
+                        dones,
+                        infos,
+                        available_actions,
+                        values,
+                        actions,
+                        action_log_probs,
+                        rnn_states,
+                        rnn_states_critic,
+                    )
+                )
+                self.total_num_steps += self.n_rollout_threads
+
+            self.compute()
+            train_info = self.train()
+
+            if self.total_num_steps - last_log >= self.log_interval:
+                self.logger.log_stat("episode", self.completed_train_episodes, self.total_num_steps)
+                if self.train_returns:
+                    self.logger.log_stat("return_mean", np.mean(self.train_returns), self.total_num_steps)
+                    self.logger.log_stat("return_std", np.std(self.train_returns), self.total_num_steps)
+                    self.logger.log_stat("battle_won_mean", np.mean(self.train_wins), self.total_num_steps)
+                    self.logger.log_stat("ep_length_mean", np.mean(self.train_lengths), self.total_num_steps)
+                    self.train_returns.clear()
+                    self.train_wins.clear()
+                    self.train_lengths.clear()
+
+                self.logger.log_stat("mappo_value_loss", train_info["value_loss"], self.total_num_steps)
+                self.logger.log_stat("mappo_policy_loss", train_info["policy_loss"], self.total_num_steps)
+                self.logger.log_stat("mappo_entropy", train_info["dist_entropy"], self.total_num_steps)
+                self.logger.log_stat("mappo_actor_grad_norm", train_info["actor_grad_norm"], self.total_num_steps)
+                self.logger.log_stat("mappo_critic_grad_norm", train_info["critic_grad_norm"], self.total_num_steps)
+                self.logger.log_stat("mappo_ratio", train_info["ratio"], self.total_num_steps)
+                self.logger.log_stat("belief_loss", train_info["belief_loss"], self.total_num_steps)
+                self.logger.log_stat("belief_raw_nll", train_info["belief_raw_nll"], self.total_num_steps)
+                self.logger.log_stat("belief_weight", train_info["belief_weight"], self.total_num_steps)
+                self.logger.log_stat("belief_logvar_mean", train_info["belief_logvar_mean"], self.total_num_steps)
+                self.logger.log_stat("belief_unseen_frac", train_info["belief_unseen_frac"], self.total_num_steps)
+                self.logger.log_stat("belief_gate_alpha", train_info["belief_gate_alpha"], self.total_num_steps)
+                self.logger.log_stat("belief_detach_alpha", train_info["belief_detach_alpha"], self.total_num_steps)
+                self.logger.log_stat("belief_policy_alpha", train_info["belief_policy_alpha"], self.total_num_steps)
+                self.logger.console_logger.info("t_env: %s / %s", self.total_num_steps, self.num_env_steps)
+                self.logger.console_logger.info(
+                    "Estimated time left: %s. Time passed: %s",
+                    time_left(last_time, last_log, self.total_num_steps, self.num_env_steps),
+                    time_str(time.time() - start),
+                )
+                last_time = time.time()
+                self.logger.print_recent_stats()
+                last_log = self.total_num_steps
+
+            if self.use_eval and self.total_num_steps - last_eval >= self.eval_interval:
+                self.eval(self.total_num_steps)
+                last_eval = self.total_num_steps
+
+            if self.args.save_model and self.total_num_steps - last_save >= self.save_interval:
+                self.save(self.total_num_steps)
+                last_save = self.total_num_steps
+
+        if self.use_eval:
+            self.eval(self.total_num_steps)
+        self.logger.console_logger.info("Finished Training")
+
+    @torch.no_grad()
+    def eval(self, total_num_steps):
+        eval_obs, eval_share_obs, eval_available_actions = self.eval_envs.reset()
+        eval_rnn_states = np.zeros(
+            (self.n_eval_rollout_threads, self.num_agents, self.args.recurrent_N, self.args.hidden_size),
+            dtype=np.float32,
+        )
+        eval_masks = np.ones((self.n_eval_rollout_threads, self.num_agents, 1), dtype=np.float32)
+        eval_prev_actions = np.zeros(
+            (self.n_eval_rollout_threads, self.num_agents, self.n_actions),
+            dtype=np.float32,
+        )
+        eval_agent_ids = np.broadcast_to(
+            np.eye(self.num_agents, dtype=np.float32).reshape(1, self.num_agents, self.num_agents),
+            (self.n_eval_rollout_threads, self.num_agents, self.num_agents),
+        ).copy()
+
+        eval_returns = np.zeros(self.n_eval_rollout_threads, dtype=np.float32)
+        completed_returns = []
+        completed_wins = []
+        completed = 0
+
+        while completed < self.eval_episodes:
+            self._sync_belief_progress(total_num_steps)
+            self.trainer.prep_rollout()
+            eval_actions, eval_rnn_states = self.policy.act(
+                np.concatenate(eval_obs),
+                np.concatenate(eval_prev_actions),
+                np.concatenate(eval_agent_ids),
+                np.concatenate(eval_rnn_states),
+                np.concatenate(eval_masks),
+                np.concatenate(eval_available_actions),
+                deterministic=True,
+            )
+            eval_actions = np.array(np.split(_t2n(eval_actions), self.n_eval_rollout_threads))
+            eval_rnn_states = np.array(np.split(_t2n(eval_rnn_states), self.n_eval_rollout_threads))
+            eval_prev_actions = self._actions_to_onehot(eval_actions)
+
+            eval_obs, eval_share_obs, eval_rewards, eval_dones, eval_infos, eval_available_actions = self.eval_envs.step(
+                eval_actions
+            )
+            eval_returns += eval_rewards[:, 0, 0]
+            eval_dones_env = np.all(eval_dones, axis=1)
+
+            if np.any(eval_dones_env):
+                eval_rnn_states[eval_dones_env] = 0.0
+                eval_prev_actions[eval_dones_env] = 0.0
+            eval_masks = np.ones((self.n_eval_rollout_threads, self.num_agents, 1), dtype=np.float32)
+            eval_masks[eval_dones_env] = 0.0
+
+            for env_i, done in enumerate(eval_dones_env):
+                if done:
+                    completed += 1
+                    completed_returns.append(float(eval_returns[env_i]))
+                    completed_wins.append(float(eval_infos[env_i][0].get("won", False)))
+                    eval_returns[env_i] = 0.0
+                    if completed >= self.eval_episodes:
+                        break
+
+        self.logger.log_stat("test_return_mean", np.mean(completed_returns), total_num_steps)
+        self.logger.log_stat("test_return_std", np.std(completed_returns), total_num_steps)
+        self.logger.log_stat("test_battle_won_mean", np.mean(completed_wins), total_num_steps)
+
+    def close(self):
+        self.envs.close()
+        if self.eval_envs is not None:
+            self.eval_envs.close()

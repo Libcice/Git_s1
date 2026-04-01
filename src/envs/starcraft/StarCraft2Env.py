@@ -215,6 +215,12 @@ class StarCraft2Env(MultiAgentEnv):
             self.obs_own_health = True
         self.n_obs_pathing = 8
         self.n_obs_height = 9
+        # Compatibility defaults for MAPPO's agent-specific critic input.
+        self.use_mustalive = True
+        self.add_center_xy = True
+        self.state_agent_id = False
+        self.state_pathing_grid = self.obs_pathing_grid
+        self.state_terrain_height = self.obs_terrain_height
 
         # Rewards args
         self.reward_sparse = reward_sparse
@@ -1126,6 +1132,243 @@ class StarCraft2Env(MultiAgentEnv):
                 logging.debug("Last actions {}".format(self.last_action))
 
         return state
+
+    def get_state_enemy_feats_size(self):
+        """Returns the dimensions of the agent-conditioned enemy feature block."""
+        nf_en = 5 + self.unit_type_bits
+
+        if self.obs_all_health:
+            nf_en += 1 + self.shield_bits_enemy
+
+        if self.add_center_xy:
+            nf_en += 2
+
+        return self.n_enemies, nf_en
+
+    def get_state_ally_feats_size(self):
+        """Returns the dimensions of the agent-conditioned ally feature block."""
+        nf_al = 5 + self.unit_type_bits
+
+        if self.obs_all_health:
+            nf_al += 1 + self.shield_bits_ally
+
+        if self.state_last_action:
+            nf_al += self.n_actions
+
+        if self.add_center_xy:
+            nf_al += 2
+
+        return self.n_agents - 1, nf_al
+
+    def get_state_own_feats_size(self):
+        """Returns the size of the agent-conditioned own feature block."""
+        own_feats = 4 + self.unit_type_bits
+        if self.obs_own_health:
+            own_feats += 1 + self.shield_bits_ally
+
+        if self.state_last_action:
+            own_feats += self.n_actions
+
+        if self.add_center_xy:
+            own_feats += 2
+
+        return own_feats
+
+    def get_state_agent_size(self):
+        """Returns the size of the agent-conditioned centralized critic input."""
+        if self.obs_instead_of_state:
+            return self.get_obs_size() * self.n_agents
+
+        own_feats = self.get_state_own_feats_size()
+        move_feats = self.get_obs_move_feats_size()
+
+        n_enemies, n_enemy_feats = self.get_state_enemy_feats_size()
+        n_allies, n_ally_feats = self.get_state_ally_feats_size()
+
+        enemy_feats = n_enemies * n_enemy_feats
+        ally_feats = n_allies * n_ally_feats
+
+        all_feats = move_feats + enemy_feats + ally_feats + own_feats
+
+        if self.state_agent_id:
+            all_feats += self.n_agents
+
+        if self.state_timestep_number:
+            all_feats += 1
+
+        return all_feats
+
+    def get_state_agent(self, agent_id):
+        """Returns an agent-conditioned centralized critic input."""
+        if self.obs_instead_of_state:
+            obs_concat = np.concatenate(self.get_obs(), axis=0).astype(np.float32)
+            return obs_concat
+
+        unit = self.get_unit_by_id(agent_id)
+
+        move_feats_dim = self.get_obs_move_feats_size()
+        enemy_feats_dim = self.get_state_enemy_feats_size()
+        ally_feats_dim = self.get_state_ally_feats_size()
+        own_feats_dim = self.get_state_own_feats_size()
+
+        move_feats = np.zeros(move_feats_dim, dtype=np.float32)
+        enemy_feats = np.zeros(enemy_feats_dim, dtype=np.float32)
+        ally_feats = np.zeros(ally_feats_dim, dtype=np.float32)
+        own_feats = np.zeros(own_feats_dim, dtype=np.float32)
+        agent_id_feats = np.zeros(self.n_agents, dtype=np.float32)
+
+        center_x = self.map_x / 2
+        center_y = self.map_y / 2
+
+        if (self.use_mustalive and unit.health > 0) or (not self.use_mustalive):
+            x = unit.pos.x
+            y = unit.pos.y
+            sight_range = self.unit_sight_range(agent_id)
+
+            # Movement features.
+            avail_actions = self.get_avail_agent_actions(agent_id)
+            for m in range(self.n_actions_move):
+                move_feats[m] = avail_actions[m + 2]
+
+            ind = self.n_actions_move
+
+            if self.state_pathing_grid:
+                move_feats[ind : ind + self.n_obs_pathing] = self.get_surrounding_pathing(unit)
+                ind += self.n_obs_pathing
+
+            if self.state_terrain_height:
+                move_feats[ind:] = self.get_surrounding_height(unit)
+
+            # Enemy features.
+            for e_id, e_unit in self.enemies.items():
+                e_x = e_unit.pos.x
+                e_y = e_unit.pos.y
+                dist = self.distance(x, y, e_x, e_y)
+
+                if e_unit.health > 0:
+                    if unit.health > 0:
+                        enemy_feats[e_id, 0] = avail_actions[self.n_actions_no_attack + e_id]
+                        enemy_feats[e_id, 1] = dist / sight_range
+                        enemy_feats[e_id, 2] = (e_x - x) / sight_range
+                        enemy_feats[e_id, 3] = (e_y - y) / sight_range
+                        if dist < sight_range:
+                            enemy_feats[e_id, 4] = 1
+
+                    ind = 5
+                    if self.obs_all_health:
+                        enemy_feats[e_id, ind] = e_unit.health / e_unit.health_max
+                        ind += 1
+                        if self.shield_bits_enemy > 0:
+                            max_shield = self.unit_max_shield(e_unit)
+                            enemy_feats[e_id, ind] = e_unit.shield / max_shield
+                            ind += 1
+
+                    if self.unit_type_bits > 0:
+                        type_id = self.get_unit_type_id(e_unit, False)
+                        enemy_feats[e_id, ind + type_id] = 1
+                        ind += self.unit_type_bits
+
+                    if self.add_center_xy:
+                        enemy_feats[e_id, ind] = (e_x - center_x) / self.max_distance_x
+                        enemy_feats[e_id, ind + 1] = (e_y - center_y) / self.max_distance_y
+
+            # Ally features.
+            al_ids = [al_id for al_id in range(self.n_agents) if al_id != agent_id]
+            for i, al_id in enumerate(al_ids):
+                al_unit = self.get_unit_by_id(al_id)
+                al_x = al_unit.pos.x
+                al_y = al_unit.pos.y
+                dist = self.distance(x, y, al_x, al_y)
+                max_cd = self.unit_max_cooldown(al_unit)
+
+                if al_unit.health > 0:
+                    if unit.health > 0:
+                        if dist < sight_range:
+                            ally_feats[i, 0] = 1
+                        ally_feats[i, 1] = dist / sight_range
+                        ally_feats[i, 2] = (al_x - x) / sight_range
+                        ally_feats[i, 3] = (al_y - y) / sight_range
+
+                    if self.map_type == "MMM" and al_unit.unit_type == self.medivac_id:
+                        ally_feats[i, 4] = al_unit.energy / max_cd
+                    else:
+                        ally_feats[i, 4] = al_unit.weapon_cooldown / max_cd
+
+                    ind = 5
+                    if self.obs_all_health:
+                        ally_feats[i, ind] = al_unit.health / al_unit.health_max
+                        ind += 1
+                        if self.shield_bits_ally > 0:
+                            max_shield = self.unit_max_shield(al_unit)
+                            ally_feats[i, ind] = al_unit.shield / max_shield
+                            ind += 1
+
+                    if self.add_center_xy:
+                        ally_feats[i, ind] = (al_x - center_x) / self.max_distance_x
+                        ally_feats[i, ind + 1] = (al_y - center_y) / self.max_distance_y
+                        ind += 2
+
+                    if self.unit_type_bits > 0:
+                        type_id = self.get_unit_type_id(al_unit, True)
+                        ally_feats[i, ind + type_id] = 1
+                        ind += self.unit_type_bits
+
+                    if self.state_last_action:
+                        ally_feats[i, ind:] = self.last_action[al_id]
+
+            # Own features.
+            ind = 0
+            own_feats[0] = 1
+            own_feats[1] = 0
+            own_feats[2] = 0
+            own_feats[3] = 0
+            ind = 4
+            if self.obs_own_health:
+                own_feats[ind] = unit.health / unit.health_max
+                ind += 1
+                if self.shield_bits_ally > 0:
+                    max_shield = self.unit_max_shield(unit)
+                    own_feats[ind] = unit.shield / max_shield
+                    ind += 1
+
+            if self.add_center_xy:
+                own_feats[ind] = (x - center_x) / self.max_distance_x
+                own_feats[ind + 1] = (y - center_y) / self.max_distance_y
+                ind += 2
+
+            if self.unit_type_bits > 0:
+                type_id = self.get_unit_type_id(unit, True)
+                own_feats[ind + type_id] = 1
+                ind += self.unit_type_bits
+
+            if self.state_last_action:
+                own_feats[ind:] = self.last_action[agent_id]
+
+        state = np.concatenate(
+            (
+                ally_feats.flatten(),
+                enemy_feats.flatten(),
+                move_feats.flatten(),
+                own_feats.flatten(),
+            )
+        )
+
+        if self.state_agent_id:
+            agent_id_feats[agent_id] = 1.0
+            state = np.append(state, agent_id_feats.flatten())
+
+        if self.state_timestep_number:
+            state = np.append(state, self._episode_steps / self.episode_limit)
+
+        if self.debug:
+            logging.debug("State Agent: {}".format(agent_id).center(60, "-"))
+            logging.debug("Avail. actions {}".format(self.get_avail_agent_actions(agent_id)))
+            logging.debug("Move feats {}".format(move_feats))
+            logging.debug("Enemy feats {}".format(enemy_feats))
+            logging.debug("Ally feats {}".format(ally_feats))
+            logging.debug("Own feats {}".format(own_feats))
+
+        return state.astype(dtype=np.float32)
 
     def get_obs_enemy_feats_size(self):
         """ Returns the dimensions of the matrix containing enemy features.
