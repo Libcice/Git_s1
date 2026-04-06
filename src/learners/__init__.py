@@ -51,4 +51,5 @@ from .q_learner_enemy_history_belief import QLearnerEnemyHistoryBelief
 REGISTRY["q_learner_enemy_history_belief"] = QLearnerEnemyHistoryBelief
 from .q_learner_belief_slot_transformer import QLearnerBeliefSlotTransformer
 REGISTRY["q_learner_belief_slot_transformer"] = QLearnerBeliefSlotTransformer
-
+from .q_learner_history_slot_belief import QLearnerHistorySlotBelief
+REGISTRY["q_learner_history_slot_belief"] = QLearnerHistorySlotBelief

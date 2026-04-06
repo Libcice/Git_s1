@@ -41,8 +41,11 @@ from .enemy_history_transformer_belief_agent import EnemyHistoryTransformerBelie
 REGISTRY["enemy_history_transformer_belief"] = EnemyHistoryTransformerBeliefAgent
 from .belief_slot_transformer_agent import BeliefSlotTransformerAgent
 REGISTRY["belief_slot_transformer"] = BeliefSlotTransformerAgent
+from .history_slot_belief_agent import HistorySlotBeliefAgent
+REGISTRY["history_slot_belief"] = HistorySlotBeliefAgent
+from .current_slot_belief_rnn_agent import CurrentSlotBeliefRNNAgent
+REGISTRY["current_slot_belief_rnn"] = CurrentSlotBeliefRNNAgent
 
 from .TrXL_belief_agent import TrXLBeliefAgent
 REGISTRY["TrXL_belief_agent"] = TrXLBeliefAgent
 REGISTRY["trxl_belief_agent"] = TrXLBeliefAgent
-
