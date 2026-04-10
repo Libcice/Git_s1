@@ -1,0 +1,44 @@
+# --- QMIX + TrXL belief ---
+
+action_selector: "epsilon_greedy"
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 50000
+
+runner: "episode"
+buffer_size: 2000
+target_update_interval: 200
+
+agent_output_type: "q"
+learner: "q_learner_history_token_belief"
+double_q: True
+mixer: "qmix"
+mixing_embed_dim: 32
+hypernet_layers: 2
+hypernet_embed: 64
+
+mac: "TrXL_belief_mac"
+agent: "TrXL_belief_agent"
+
+transformer_hidden_dim: 48
+transformer_heads: 4
+transformer_layers: 2
+transformer_dropout: 0.0
+
+# TrXL encoder choice:
+# "builtin" uses nn.TransformerEncoder
+# "self_written" uses the custom implementation in modules/agents/TrXL.py
+trxl_impl: "builtin"
+trxl_activation: "relu"
+trxl_norm_first: False
+trxl_final_norm: False
+trxl_ff_mult: 4
+
+belief_loss_coef: 0.001
+belief_logvar_min: -2.0
+belief_logvar_max: 1.0
+belief_lowrank_rank: 3
+belief_nll_clip: 2.0
+belief_warmup_t: 500000
+
+name: "qmix_trxl_belief"

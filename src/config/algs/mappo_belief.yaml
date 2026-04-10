@@ -1,0 +1,111 @@
+# --- MAPPO belief transformer ---
+name: "mappo_belief"
+use_onpolicy_mappo_belief: True
+algorithm_name: "rmappo"
+
+agent_output_type: "pi_logits"
+action_selector: "multinomial"
+batch_size_run: 8
+
+lr: 0.0005
+critic_lr: 0.0005
+opti_eps: 0.00001
+weight_decay: 0
+
+clip_param: 0.2
+ppo_epoch: 5
+num_mini_batch: 2
+data_chunk_length: 10
+entropy_coef: 0.01
+value_loss_coef: 1.0
+max_grad_norm: 10
+gamma: 0.99
+gae_lambda: 0.95
+huber_delta: 10.0
+
+hidden_size: 64
+recurrent_N: 1
+use_recurrent_policy: True
+use_naive_recurrent_policy: False
+use_feature_normalization: True
+use_orthogonal: True
+use_ReLU: True
+layer_N: 1
+stacked_frames: 1
+gain: 1
+
+use_centralized_V: True
+use_policy_active_masks: True
+use_value_active_masks: True
+use_clipped_value_loss: True
+use_huber_loss: True
+use_valuenorm: True
+use_popart: False
+use_gae: True
+use_proper_time_limits: False
+use_max_grad_norm: True
+
+transformer_heads: 4
+transformer_layers: 2
+# Match the history-token QMIX idea by giving the actor an explicit
+# K-step token window instead of only the current-step tokenization.
+history_steps: 1
+transformer_dropout: 0.0
+trxl_impl: "builtin"
+trxl_activation: "relu"
+trxl_norm_first: False
+trxl_final_norm: False
+trxl_ff_mult: 4
+# "cross_attention" lets memory query encoded current-step tokens explicitly.
+# Set back to "self_attention_token" to recover the old memory-token encoder path.
+belief_memory_update: "cross_attention"
+
+belief_loss_coef: 0.001
+belief_logvar_min: -2.0
+belief_logvar_max: 1.0
+belief_lowrank_rank: 3
+belief_nll_clip: 2.0
+belief_warmup_t: 500000
+# Optional latent-state belief filter. When enabled, the actor keeps a
+# deterministic transformer state h_t plus a stochastic latent state z_t.
+use_latent_belief: False
+latent_belief_dim: 64
+latent_kl_coef: 0.001
+latent_kl_warmup_t: 500000
+latent_logvar_min: -4.0
+latent_logvar_max: 2.0
+# Experimental MAPPO-belief toggles.
+# Keep all of these False by default unless a specific ablation needs them.
+# `use_residual_belief_actor=False` keeps the original transformer-belief actor path.
+use_residual_belief_actor: False
+# Residual-only: maximum strength of the residual belief correction.
+belief_residual_alpha: 0.3
+# Optional uncertainty gate for belief features before they affect the actor.
+use_belief_gate: False
+# Optional belief-aware critic path. Leave False for the cleaner actor-only setup.
+use_belief_critic: False
+# Hard detach: blocks policy gradients from flowing back into the belief branch.
+detach_belief_to_policy: False
+# Scheduled detach: start detached, then linearly re-enable policy gradients.
+scheduled_detach_belief: False
+detach_belief_until_t: 1500000
+detach_belief_release_t: 2500000
+# Scale of belief influence on the actor forward pass.
+belief_policy_alpha: 1.0
+# Scheduled forward scaling: fade belief into the actor over time.
+scheduled_belief_policy: False
+belief_policy_until_t: 0
+belief_policy_release_t: 1500000
+# Gate warmup used only when `use_belief_gate=True`.
+belief_gate_warmup_t: 1000000
+# Gate sharpness used only when `use_belief_gate=True`.
+belief_confidence_temp: 2.0
+
+num_env_steps: 4010000
+use_eval: True
+use_linear_lr_decay: False
+n_eval_rollout_threads: 1
+eval_episodes: 32
+eval_interval: 10000
+save_model: False
+local_results_path: "results"

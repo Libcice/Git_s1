@@ -1,0 +1,667 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+try:
+    from gym.spaces import Box
+except ImportError:
+    from gymnasium.spaces import Box
+
+from mappo_onpolicy.models.act import ACTLayer
+from mappo_onpolicy.models.actor_critic import R_Critic
+from mappo_onpolicy.models.distributions import Categorical, FixedCategorical
+from mappo_onpolicy.models.mlp import MLPBase
+from mappo_onpolicy.models.rnn import RNNLayer
+from mappo_onpolicy.models.util import check
+from mappo_onpolicy.utils.util import get_shape_from_obs_space
+from mappo_belief.models.smac_tokenizer import SMACTokenizer
+from mappo_belief.models.trxl import build_trxl_encoder
+
+
+def _augment_box_space(space, context_dim):
+    shape = tuple(space.shape)
+    if len(shape) != 1:
+        raise NotImplementedError("BeliefAwareCritic currently expects flat centralized observations")
+    aug_shape = (shape[0] + context_dim,)
+    low = np.full(aug_shape, -np.inf, dtype=np.float32)
+    high = np.full(aug_shape, np.inf, dtype=np.float32)
+    return Box(low=low, high=high, dtype=np.float32)
+
+
+class BeliefAwareCritic(nn.Module):
+    def __init__(self, args, cent_obs_space, device=torch.device("cpu")):
+        super().__init__()
+        self.use_belief_critic = getattr(args, "use_belief_critic", False)
+        self.context_dim = args.hidden_size
+        self.tpdv = dict(dtype=torch.float32, device=device)
+
+        critic_space = _augment_box_space(cent_obs_space, self.context_dim) if self.use_belief_critic else cent_obs_space
+        self.critic = R_Critic(args, critic_space, device=device)
+        self.v_out = self.critic.v_out
+        self.context_adapter = nn.Sequential(
+            nn.LayerNorm(self.context_dim),
+            nn.Linear(self.context_dim, self.context_dim),
+            nn.ReLU(),
+        )
+        self.to(device)
+
+    def forward(self, cent_obs, critic_context, rnn_states, masks):
+        if not self.use_belief_critic:
+            return self.critic(cent_obs, rnn_states, masks)
+
+        cent_obs = check(cent_obs).to(**self.tpdv)
+        if critic_context is None:
+            raise ValueError("critic_context is required when use_belief_critic=True")
+        critic_context = check(critic_context).to(**self.tpdv).detach()
+        critic_context = self.context_adapter(critic_context)
+        critic_input = torch.cat([cent_obs, critic_context], dim=-1)
+        return self.critic(critic_input, rnn_states, masks)
+
+
+class BeliefTransformerActor(nn.Module):
+    def __init__(self, args, obs_space, action_space, device=torch.device("cpu")):
+        super().__init__()
+        self.args = args
+        self.hidden_size = args.hidden_size
+        self._gain = args.gain
+        self._use_orthogonal = args.use_orthogonal
+        self._use_policy_active_masks = args.use_policy_active_masks
+        self._recurrent_N = args.recurrent_N
+        self.tpdv = dict(dtype=torch.float32, device=device)
+        self.device = device
+
+        self.tokenizer = SMACTokenizer(args, device)
+        self.layout = self.tokenizer.layout
+        self.token_dim = self.layout.token_dim
+        self.n_enemies = args.enemy_num
+        self.enemy_state_feat_dim = self.layout.enemy_state_feat_dim
+        self.belief_lowrank_rank = getattr(args, "belief_lowrank_rank", 3)
+        self.use_belief_gate = getattr(args, "use_belief_gate", True)
+        self.belief_gate_warmup_t = getattr(args, "belief_gate_warmup_t", getattr(args, "belief_warmup_t", 500000))
+        self.belief_confidence_temp = getattr(args, "belief_confidence_temp", 1.0)
+        self.belief_logvar_min = getattr(args, "belief_logvar_min", -2.0)
+        self.belief_logvar_max = getattr(args, "belief_logvar_max", 1.0)
+        self.detach_belief_to_policy = getattr(args, "detach_belief_to_policy", False)
+        self.scheduled_detach_belief = getattr(args, "scheduled_detach_belief", False)
+        self.detach_belief_until_t = getattr(args, "detach_belief_until_t", 1500000)
+        self.detach_belief_release_t = getattr(args, "detach_belief_release_t", 2500000)
+        self.belief_policy_alpha = getattr(args, "belief_policy_alpha", 1.0)
+        self.scheduled_belief_policy = getattr(args, "scheduled_belief_policy", False)
+        self.belief_policy_until_t = getattr(args, "belief_policy_until_t", 0)
+        self.belief_policy_release_t = getattr(args, "belief_policy_release_t", 1500000)
+
+        self.token_embed = nn.Linear(self.token_dim, self.hidden_size)
+        self.max_seq_len = 1 + self.layout.tokens_per_step
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.max_seq_len, self.hidden_size))
+        self.encoder = build_trxl_encoder(
+            hidden_dim=self.hidden_size,
+            n_heads=getattr(args, "transformer_heads", 4),
+            n_layers=getattr(args, "transformer_layers", 2),
+            dropout=getattr(args, "transformer_dropout", 0.0),
+            activation=getattr(args, "trxl_activation", "relu"),
+            norm_first=getattr(args, "trxl_norm_first", False),
+            final_norm=getattr(args, "trxl_final_norm", False),
+            ff_mult=getattr(args, "trxl_ff_mult", 4),
+            impl=getattr(args, "trxl_impl", "builtin"),
+        )
+
+        belief_out_dim = self.n_enemies * self.enemy_state_feat_dim
+        self.belief_mu_head = nn.Linear(self.hidden_size, belief_out_dim)
+        self.belief_logvar_head = nn.Linear(self.hidden_size, belief_out_dim)
+        self.belief_u_head = nn.Linear(
+            self.hidden_size,
+            belief_out_dim * self.belief_lowrank_rank,
+        )
+
+        self.belief_enemy_proj = nn.Linear(self.enemy_state_feat_dim, self.hidden_size)
+        self.use_split_belief_logits = (
+            action_space.__class__.__name__ == "Discrete"
+            and not getattr(args, "use_residual_belief_actor", False)
+        )
+        # Old: flatten every enemy slot before the policy head.
+        # self.policy_in_dim = self.hidden_size * (4 + self.n_enemies)
+        # self.policy_proj = nn.Sequential(
+        #     nn.Linear(self.policy_in_dim, self.hidden_size),
+        #     nn.ReLU(),
+        # )
+        if self.use_split_belief_logits:
+            self.base_policy_in_dim = self.hidden_size * 5
+            self.base_policy_proj = nn.Sequential(
+                nn.Linear(self.base_policy_in_dim, self.hidden_size),
+                nn.ReLU(),
+            )
+            # Let belief correct per-action logits directly instead of being buried in one shared hidden vector.
+            self.belief_policy_in_dim = self.hidden_size * 2
+            self.belief_policy_proj = nn.Sequential(
+                nn.Linear(self.belief_policy_in_dim, self.hidden_size),
+                nn.ReLU(),
+            )
+            self.base_action_out = Categorical(self.hidden_size, action_space.n, self._use_orthogonal, self._gain)
+            self.belief_action_out = Categorical(self.hidden_size, action_space.n, self._use_orthogonal, self._gain)
+        else:
+            # Old: read visible and unseen enemies as two summary streams.
+            # self.policy_in_dim = self.hidden_size * 6
+            # Keep visible and unseen enemy summaries separate for the MAPPO actor.
+            self.policy_in_dim = self.hidden_size * 6
+            self.policy_proj = nn.Sequential(
+                nn.Linear(self.policy_in_dim, self.hidden_size),
+                nn.ReLU(),
+            )
+        self.act = ACTLayer(action_space, self.hidden_size, self._use_orthogonal, self._gain, args)
+        # Track gate progress for logging; when the gate is disabled this buffer stays at 1.0 for a clean control run.
+        self.register_buffer("_belief_gate_alpha", torch.zeros(1, device=device))
+        detach_init = 1.0 if (self.detach_belief_to_policy or self.scheduled_detach_belief) else 0.0
+        self.register_buffer("_belief_detach_alpha", torch.full((1,), detach_init, device=device))
+        policy_alpha_init = 0.0 if self.scheduled_belief_policy else float(self.belief_policy_alpha)
+        self.register_buffer("_belief_policy_alpha", torch.full((1,), policy_alpha_init, device=device))
+        self.to(device)
+
+    def init_hidden(self):
+        return self.token_embed.weight.new_zeros(1, self.hidden_size)
+
+    def _masked_mean(self, feats, mask):
+        if feats.size(1) == 0:
+            return feats.new_zeros(feats.size(0), feats.size(-1))
+        mask = mask.unsqueeze(-1).float()
+        denom = mask.sum(dim=1).clamp(min=1.0)
+        return (feats * mask).sum(dim=1) / denom
+
+    def set_belief_gate_progress(self, total_num_steps):
+        if not self.use_belief_gate:
+            alpha = 1.0
+        elif self.belief_gate_warmup_t <= 0:
+            alpha = 1.0
+        else:
+            alpha = min(1.0, float(total_num_steps) / float(self.belief_gate_warmup_t))
+        self._belief_gate_alpha.fill_(alpha)
+
+        if self.scheduled_detach_belief:
+            detach_start = float(self.detach_belief_until_t)
+            detach_end = float(max(self.detach_belief_release_t, self.detach_belief_until_t))
+            if float(total_num_steps) <= detach_start:
+                detach_alpha = 1.0
+            elif float(total_num_steps) >= detach_end:
+                detach_alpha = 0.0
+            else:
+                detach_alpha = 1.0 - ((float(total_num_steps) - detach_start) / max(detach_end - detach_start, 1.0))
+        else:
+            detach_alpha = 1.0 if self.detach_belief_to_policy else 0.0
+        self._belief_detach_alpha.fill_(detach_alpha)
+
+        if self.scheduled_belief_policy:
+            policy_start = float(self.belief_policy_until_t)
+            policy_end = float(max(self.belief_policy_release_t, self.belief_policy_until_t))
+            if float(total_num_steps) <= policy_start:
+                policy_alpha = 0.0
+            elif float(total_num_steps) >= policy_end:
+                policy_alpha = float(self.belief_policy_alpha)
+            else:
+                policy_alpha = float(self.belief_policy_alpha) * (
+                    (float(total_num_steps) - policy_start) / max(policy_end - policy_start, 1.0)
+                )
+        else:
+            policy_alpha = float(self.belief_policy_alpha)
+        self._belief_policy_alpha.fill_(policy_alpha)
+
+    def get_belief_gate_alpha(self):
+        return float(self._belief_gate_alpha.item())
+
+    def get_belief_detach_alpha(self):
+        return float(self._belief_detach_alpha.item())
+
+    def get_belief_policy_alpha(self):
+        return float(self._belief_policy_alpha.item())
+
+    def _policy_belief_alpha_tensor(self, ref_tensor):
+        return self._belief_policy_alpha.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+
+    def _build_unseen_belief_mask(self, enemy_visible, belief_logvar):
+        # Set use_belief_gate=False to recover the ungated baseline while keeping the rest of the actor unchanged.
+        if not self.use_belief_gate:
+            return 1.0 - enemy_visible
+        belief_logvar = belief_logvar.clamp(min=self.belief_logvar_min, max=self.belief_logvar_max)
+        confidence = torch.sigmoid(-belief_logvar.mean(dim=-1) / max(self.belief_confidence_temp, 1e-6))
+        gate_alpha = self._belief_gate_alpha.to(device=enemy_visible.device, dtype=enemy_visible.dtype)
+        return (1.0 - enemy_visible) * confidence * gate_alpha
+
+    def _build_actor_enemy_context(
+        self,
+        visible_enemy_feat,
+        belief_enemy_feat,
+        enemy_visible,
+        belief_logvar,
+        policy_alpha,
+    ):
+        unseen_belief_mask = self._build_unseen_belief_mask(enemy_visible, belief_logvar)
+        visible_enemy_summary = self._masked_mean(visible_enemy_feat, enemy_visible)
+        unseen_enemy_summary = self._masked_mean(belief_enemy_feat, unseen_belief_mask)
+
+        # Compatibility summary for logs and downstream code that still expects one enemy context tensor.
+        policy_belief_enemy_feat = belief_enemy_feat * policy_alpha
+        fused_enemy_feat = (
+            enemy_visible.unsqueeze(-1) * visible_enemy_feat
+            + unseen_belief_mask.unsqueeze(-1) * policy_belief_enemy_feat
+        )
+        enemy_summary_mask = enemy_visible + unseen_belief_mask
+        enemy_summary = self._masked_mean(fused_enemy_feat, enemy_summary_mask)
+
+        # Keep critic context on the full belief path so belief-critic ablations stay orthogonal to actor-only gating.
+        critic_fused_enemy_feat = (
+            enemy_visible.unsqueeze(-1) * visible_enemy_feat
+            + unseen_belief_mask.unsqueeze(-1) * belief_enemy_feat
+        )
+        critic_context = self._masked_mean(critic_fused_enemy_feat, enemy_summary_mask)
+
+        return {
+            "actor_enemy_features": (visible_enemy_summary, unseen_enemy_summary),
+            "visible_enemy_summary": visible_enemy_summary,
+            "unseen_enemy_summary": unseen_enemy_summary,
+            "enemy_summary": enemy_summary,
+            "critic_context": critic_context,
+        }
+
+    def _encode_step(self, obs, prev_actions, agent_ids, memory):
+        step_tokens, current = self.tokenizer(obs, prev_actions=prev_actions, agent_ids=agent_ids)
+        step_emb = F.relu(self.token_embed(step_tokens))
+
+        seq = torch.cat([memory.unsqueeze(1), step_emb], dim=1)
+        seq = seq + self.pos_embed[:, :seq.size(1)]
+        encoded = self.encoder(seq)
+        new_memory = encoded[:, 0, :]
+
+        belief_mu = self.belief_mu_head(new_memory).view(-1, self.n_enemies, self.enemy_state_feat_dim)
+        belief_logvar = self.belief_logvar_head(new_memory).view(-1, self.n_enemies, self.enemy_state_feat_dim)
+        belief_u = self.belief_u_head(new_memory).view(
+            -1, self.n_enemies, self.enemy_state_feat_dim, self.belief_lowrank_rank
+        )
+
+        move_feat = F.relu(self.token_embed(current["move_token"]))
+        self_feat = F.relu(self.token_embed(current["self_token"]))
+        ally_feat = self._masked_mean(
+            F.relu(self.token_embed(current["ally_tokens"])),
+            current["ally_visible"],
+        )
+        visible_enemy_feat = F.relu(self.token_embed(current["enemy_tokens"]))
+        # Scheduled detach keeps belief self-supervised early, then gradually hands policy gradients back later in training.
+        detach_alpha = self._belief_detach_alpha.to(device=belief_mu.device, dtype=belief_mu.dtype)
+        belief_actor_src = belief_mu.detach() * detach_alpha + belief_mu * (1.0 - detach_alpha)
+        belief_enemy_feat = F.relu(self.belief_enemy_proj(belief_actor_src))
+        policy_alpha = self._policy_belief_alpha_tensor(belief_mu)
+        enemy_visible = current["enemy_visible"].float()
+        # Old: merge all enemies into one long vector.
+        # fused_enemy_feat = enemy_visible.unsqueeze(-1) * visible_enemy_feat + (1.0 - enemy_visible.unsqueeze(-1)) * belief_enemy_feat
+        # enemy_feat = fused_enemy_feat.flatten(start_dim=1)
+        # Old: split visible and unseen enemies into two summary streams.
+        # visible_enemy_summary = self._masked_mean(visible_enemy_feat, enemy_visible)
+        # unseen_belief_mask = self._build_unseen_belief_mask(enemy_visible, belief_logvar)
+        # unseen_enemy_summary = self._masked_mean(belief_enemy_feat, unseen_belief_mask)
+        actor_enemy_context = self._build_actor_enemy_context(
+            visible_enemy_feat,
+            belief_enemy_feat,
+            enemy_visible,
+            belief_logvar,
+            policy_alpha,
+        )
+
+        if self.use_split_belief_logits:
+            base_actor_features = self.base_policy_proj(
+                torch.cat(
+                    [
+                        new_memory,
+                        move_feat,
+                        self_feat,
+                        ally_feat,
+                        actor_enemy_context["visible_enemy_summary"],
+                    ],
+                    dim=-1,
+                )
+            )
+            belief_policy_features = self.belief_policy_proj(
+                torch.cat(
+                    [new_memory, actor_enemy_context["unseen_enemy_summary"]],
+                    dim=-1,
+                )
+            )
+            actor_features = base_actor_features
+        else:
+            actor_enemy_features = actor_enemy_context["actor_enemy_features"]
+            if len(actor_enemy_features) == 1:
+                actor_enemy_features = actor_enemy_features[0]
+            else:
+                actor_enemy_features = torch.cat(actor_enemy_features, dim=-1)
+
+            actor_features = self.policy_proj(
+                torch.cat(
+                    [new_memory, move_feat, self_feat, ally_feat, actor_enemy_features],
+                    dim=-1,
+                )
+            )
+            belief_policy_features = None
+        aux = {
+            "belief_mu": belief_mu,
+            "belief_logvar": belief_logvar,
+            "belief_u": belief_u,
+            "enemy_visible": current["enemy_visible"],
+            "visible_enemy_summary": actor_enemy_context["visible_enemy_summary"],
+            "unseen_enemy_summary": actor_enemy_context["unseen_enemy_summary"],
+            "enemy_summary": actor_enemy_context["enemy_summary"],
+            "critic_context": actor_enemy_context["critic_context"],
+        }
+        if belief_policy_features is not None:
+            aux["belief_policy_features"] = belief_policy_features
+        return actor_features, new_memory, aux
+
+    def _encode(self, obs, prev_actions, agent_ids, rnn_states, masks):
+        obs = check(obs).to(**self.tpdv)
+        rnn_states = check(rnn_states).to(**self.tpdv)
+        masks = check(masks).to(**self.tpdv)
+        if prev_actions is not None:
+            prev_actions = check(prev_actions).to(**self.tpdv)
+        if agent_ids is not None:
+            agent_ids = check(agent_ids).to(**self.tpdv)
+
+        # Rollout path: one hidden state per sample.
+        if rnn_states.size(0) == obs.size(0):
+            memory = rnn_states[:, 0, :] * masks
+            actor_features, new_memory, aux = self._encode_step(obs, prev_actions, agent_ids, memory)
+            return actor_features, new_memory.unsqueeze(1), aux
+
+        # Training path: recurrent mini-batches provide initial memory for each chunk.
+        batch_size = rnn_states.size(0)
+        seq_len = obs.size(0) // batch_size
+        obs = obs.view(seq_len, batch_size, -1)
+        masks = masks.view(seq_len, batch_size, -1)
+        if prev_actions is not None:
+            prev_actions = prev_actions.view(seq_len, batch_size, -1)
+        if agent_ids is not None:
+            agent_ids = agent_ids.view(seq_len, batch_size, -1)
+
+        memory = rnn_states[:, 0, :]
+        actor_features = []
+        belief_mu = []
+        belief_logvar = []
+        belief_u = []
+        enemy_visible = []
+        visible_enemy_summary = []
+        unseen_enemy_summary = []
+        enemy_summary = []
+        critic_context = []
+        belief_policy_features = [] if self.use_split_belief_logits else None
+
+        for t in range(seq_len):
+            memory = memory * masks[t]
+            step_prev_actions = prev_actions[t] if prev_actions is not None else None
+            step_agent_ids = agent_ids[t] if agent_ids is not None else None
+            step_features, memory, step_aux = self._encode_step(
+                obs[t], step_prev_actions, step_agent_ids, memory
+            )
+            actor_features.append(step_features)
+            belief_mu.append(step_aux["belief_mu"])
+            belief_logvar.append(step_aux["belief_logvar"])
+            belief_u.append(step_aux["belief_u"])
+            enemy_visible.append(step_aux["enemy_visible"])
+            visible_enemy_summary.append(step_aux["visible_enemy_summary"])
+            unseen_enemy_summary.append(step_aux["unseen_enemy_summary"])
+            enemy_summary.append(step_aux["enemy_summary"])
+            critic_context.append(step_aux["critic_context"])
+            if belief_policy_features is not None:
+                belief_policy_features.append(step_aux["belief_policy_features"])
+
+        actor_features = torch.cat(actor_features, dim=0)
+        aux = {
+            "belief_mu": torch.cat(belief_mu, dim=0),
+            "belief_logvar": torch.cat(belief_logvar, dim=0),
+            "belief_u": torch.cat(belief_u, dim=0),
+            "enemy_visible": torch.cat(enemy_visible, dim=0),
+            "visible_enemy_summary": torch.cat(visible_enemy_summary, dim=0),
+            "unseen_enemy_summary": torch.cat(unseen_enemy_summary, dim=0),
+            "enemy_summary": torch.cat(enemy_summary, dim=0),
+            "critic_context": torch.cat(critic_context, dim=0),
+        }
+        if belief_policy_features is not None:
+            aux["belief_policy_features"] = torch.cat(belief_policy_features, dim=0)
+        return actor_features, memory.unsqueeze(1), aux
+
+    def get_critic_context(self, obs, prev_actions, agent_ids, rnn_states, masks):
+        _, _, aux = self._encode(obs, prev_actions, agent_ids, rnn_states, masks)
+        return aux["critic_context"]
+
+    def _build_action_distribution(self, actor_features, belief_policy_features, available_actions=None):
+        if not self.use_split_belief_logits:
+            return self.act.action_out(actor_features, available_actions)
+
+        base_logits = self.base_action_out.linear(actor_features)
+        belief_logits = self.belief_action_out.linear(belief_policy_features)
+        policy_alpha = self._policy_belief_alpha.to(
+            device=base_logits.device, dtype=base_logits.dtype
+        )
+        action_logits = base_logits + policy_alpha * belief_logits
+        if available_actions is not None:
+            action_logits = action_logits.masked_fill(available_actions == 0, -1e10)
+        return FixedCategorical(logits=action_logits)
+
+    def forward(
+        self,
+        obs,
+        prev_actions,
+        agent_ids,
+        rnn_states,
+        masks,
+        available_actions=None,
+        deterministic=False,
+        return_aux=False,
+    ):
+        if available_actions is not None:
+            available_actions = check(available_actions).to(**self.tpdv)
+
+        actor_features, new_rnn_states, aux = self._encode(
+            obs, prev_actions, agent_ids, rnn_states, masks
+        )
+        if self.use_split_belief_logits:
+            action_dist = self._build_action_distribution(
+                actor_features,
+                aux["belief_policy_features"],
+                available_actions,
+            )
+            actions = action_dist.mode() if deterministic else action_dist.sample()
+            action_log_probs = action_dist.log_probs(actions)
+        else:
+            actions, action_log_probs = self.act(actor_features, available_actions, deterministic)
+        if return_aux:
+            return actions, action_log_probs, new_rnn_states, aux
+        return actions, action_log_probs, new_rnn_states
+
+    def evaluate_actions(
+        self,
+        obs,
+        prev_actions,
+        agent_ids,
+        rnn_states,
+        action,
+        masks,
+        available_actions=None,
+        active_masks=None,
+        return_aux=False,
+    ):
+        action = check(action).to(**self.tpdv)
+        if available_actions is not None:
+            available_actions = check(available_actions).to(**self.tpdv)
+        if active_masks is not None:
+            active_masks = check(active_masks).to(**self.tpdv)
+
+        actor_features, _, aux = self._encode(obs, prev_actions, agent_ids, rnn_states, masks)
+        if self.use_split_belief_logits:
+            action_dist = self._build_action_distribution(
+                actor_features,
+                aux["belief_policy_features"],
+                available_actions,
+            )
+            action_log_probs = action_dist.log_probs(action)
+            if active_masks is not None and self._use_policy_active_masks:
+                dist_entropy = (action_dist.entropy() * active_masks.squeeze(-1)).sum() / active_masks.sum()
+            else:
+                dist_entropy = action_dist.entropy().mean()
+        else:
+            action_log_probs, dist_entropy = self.act.evaluate_actions(
+                actor_features,
+                action,
+                available_actions,
+                active_masks=active_masks if self._use_policy_active_masks else None,
+            )
+        if return_aux:
+            return action_log_probs, dist_entropy, aux
+        return action_log_probs, dist_entropy
+
+
+class ResidualBeliefActor(BeliefTransformerActor):
+    """Plain MAPPO backbone plus a bounded residual correction from the belief branch."""
+
+    def __init__(self, args, obs_space, action_space, device=torch.device("cpu")):
+        super().__init__(args, obs_space, action_space, device)
+        obs_shape = get_shape_from_obs_space(obs_space)
+        if len(obs_shape) != 1:
+            raise NotImplementedError("ResidualBeliefActor currently expects flat observations")
+
+        self.base = MLPBase(args, obs_shape)
+        self.base_rnn = RNNLayer(self.hidden_size, self.hidden_size, self._recurrent_N, self._use_orthogonal)
+        self.belief_residual_alpha = getattr(args, "belief_residual_alpha", 0.3)
+        self.belief_residual_proj = nn.Linear(self.hidden_size, self.hidden_size)
+        self.actor_state_size = self.hidden_size * 2
+        self.policy_in_dim = self.hidden_size * 5
+        self.policy_proj = nn.Sequential(
+            nn.Linear(self.policy_in_dim, self.hidden_size),
+            nn.ReLU(),
+        )
+
+        # Reinterpret the policy alpha schedule as the residual strength schedule for this actor.
+        self.belief_policy_alpha = self.belief_residual_alpha
+        if self.scheduled_belief_policy:
+            self._belief_policy_alpha.fill_(0.0)
+        else:
+            self._belief_policy_alpha.fill_(float(self.belief_policy_alpha))
+
+        self.to(device)
+
+    def init_hidden(self):
+        return self.token_embed.weight.new_zeros(1, self.actor_state_size)
+
+    def _policy_belief_alpha_tensor(self, ref_tensor):
+        # Residual mode extracts an unscaled belief branch, then applies the schedule at the residual output.
+        return torch.ones(1, device=ref_tensor.device, dtype=ref_tensor.dtype)
+
+    def _encode_step(self, obs, prev_actions, agent_ids, memory):
+        step_tokens, current = self.tokenizer(obs, prev_actions=prev_actions, agent_ids=agent_ids)
+        step_emb = F.relu(self.token_embed(step_tokens))
+
+        seq = torch.cat([memory.unsqueeze(1), step_emb], dim=1)
+        seq = seq + self.pos_embed[:, :seq.size(1)]
+        encoded = self.encoder(seq)
+        new_memory = encoded[:, 0, :]
+
+        belief_mu = self.belief_mu_head(new_memory).view(-1, self.n_enemies, self.enemy_state_feat_dim)
+        belief_logvar = self.belief_logvar_head(new_memory).view(-1, self.n_enemies, self.enemy_state_feat_dim)
+        belief_u = self.belief_u_head(new_memory).view(
+            -1, self.n_enemies, self.enemy_state_feat_dim, self.belief_lowrank_rank
+        )
+
+        move_feat = F.relu(self.token_embed(current["move_token"]))
+        self_feat = F.relu(self.token_embed(current["self_token"]))
+        ally_feat = self._masked_mean(
+            F.relu(self.token_embed(current["ally_tokens"])),
+            current["ally_visible"],
+        )
+        visible_enemy_feat = F.relu(self.token_embed(current["enemy_tokens"]))
+        # Scheduled detach keeps belief self-supervised early, then gradually hands policy gradients back later in training.
+        detach_alpha = self._belief_detach_alpha.to(device=belief_mu.device, dtype=belief_mu.dtype)
+        belief_actor_src = belief_mu.detach() * detach_alpha + belief_mu * (1.0 - detach_alpha)
+        # A separate forward alpha delays how strongly belief can steer action logits.
+        belief_enemy_feat = F.relu(self.belief_enemy_proj(belief_actor_src))
+        policy_alpha = self._policy_belief_alpha_tensor(belief_mu)
+        policy_belief_enemy_feat = belief_enemy_feat * policy_alpha
+        enemy_visible = current["enemy_visible"].float()
+
+        unseen_belief_mask = self._build_unseen_belief_mask(enemy_visible, belief_logvar)
+        fused_enemy_feat = (
+            enemy_visible.unsqueeze(-1) * visible_enemy_feat
+            + unseen_belief_mask.unsqueeze(-1) * policy_belief_enemy_feat
+        )
+        enemy_summary_mask = enemy_visible + unseen_belief_mask
+        enemy_summary = self._masked_mean(fused_enemy_feat, enemy_summary_mask)
+
+        critic_fused_enemy_feat = (
+            enemy_visible.unsqueeze(-1) * visible_enemy_feat
+            + unseen_belief_mask.unsqueeze(-1) * belief_enemy_feat
+        )
+        critic_context = self._masked_mean(critic_fused_enemy_feat, enemy_summary_mask)
+
+        actor_features = self.policy_proj(
+            torch.cat(
+                [new_memory, move_feat, self_feat, ally_feat, enemy_summary],
+                dim=-1,
+            )
+        )
+        aux = {
+            "belief_mu": belief_mu,
+            "belief_logvar": belief_logvar,
+            "belief_u": belief_u,
+            "enemy_visible": current["enemy_visible"],
+            "visible_enemy_summary": enemy_summary,
+            "unseen_enemy_summary": enemy_summary,
+            "enemy_summary": enemy_summary,
+            "critic_context": critic_context,
+        }
+        return actor_features, new_memory, aux
+
+    def _pack_actor_state(self, base_rnn_states, belief_memory):
+        if belief_memory.dim() == 2:
+            belief_memory = belief_memory.unsqueeze(1)
+        packed_belief = belief_memory.expand(-1, self._recurrent_N, -1)
+        return torch.cat([base_rnn_states, packed_belief], dim=-1)
+
+    def _unpack_actor_state(self, rnn_states):
+        rnn_states = check(rnn_states).to(**self.tpdv)
+        if rnn_states.size(-1) == self.hidden_size:
+            base_rnn_states = rnn_states
+            belief_memory = torch.zeros(
+                rnn_states.size(0), 1, self.hidden_size, dtype=rnn_states.dtype, device=rnn_states.device
+            )
+            return base_rnn_states, belief_memory
+
+        if rnn_states.size(-1) != self.actor_state_size:
+            raise ValueError(
+                f"ResidualBeliefActor expected packed actor state size {self.actor_state_size}, got {rnn_states.size(-1)}"
+            )
+
+        base_rnn_states = rnn_states[..., :self.hidden_size].contiguous()
+        belief_memory = rnn_states[:, :1, self.hidden_size:].contiguous()
+        return base_rnn_states, belief_memory
+
+    def _encode_base(self, obs, base_rnn_states, masks):
+        obs = check(obs).to(**self.tpdv)
+        base_rnn_states = check(base_rnn_states).to(**self.tpdv)
+        masks = check(masks).to(**self.tpdv)
+
+        base_actor_features = self.base(obs)
+        base_actor_features, new_base_rnn_states = self.base_rnn(base_actor_features, base_rnn_states, masks)
+        return base_actor_features, new_base_rnn_states
+
+    def _encode(self, obs, prev_actions, agent_ids, rnn_states, masks):
+        base_rnn_states, belief_memory = self._unpack_actor_state(rnn_states)
+        base_actor_features, new_base_rnn_states = self._encode_base(obs, base_rnn_states, masks)
+        belief_actor_features, new_belief_states, aux = super()._encode(
+            obs, prev_actions, agent_ids, belief_memory, masks
+        )
+
+        residual_alpha = self._belief_policy_alpha.to(
+            device=belief_actor_features.device, dtype=belief_actor_features.dtype
+        )
+        belief_delta = self.belief_residual_proj(belief_actor_features)
+        actor_features = base_actor_features + residual_alpha * torch.tanh(belief_delta)
+        new_rnn_states = self._pack_actor_state(new_base_rnn_states, new_belief_states)
+
+        aux["belief_residual_norm"] = torch.norm(torch.tanh(belief_delta), dim=-1, keepdim=True)
+        return actor_features, new_rnn_states, aux
+
+
+BeliefCritic = BeliefAwareCritic

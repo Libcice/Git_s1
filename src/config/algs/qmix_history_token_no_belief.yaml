@@ -1,0 +1,39 @@
+# --- QMIX + history-token transformer no-belief ablation ---
+
+action_selector: "epsilon_greedy"
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 50000
+
+runner: "episode"
+buffer_size: 2000
+target_update_interval: 200
+
+agent_output_type: "q"
+learner: "q_learner_history_token_belief"
+double_q: True
+mixer: "qmix"
+mixing_embed_dim: 32
+hypernet_layers: 2
+hypernet_embed: 64
+
+mac: "history_token_transformer_belief_mac"
+agent: "history_token_transformer_belief"
+
+transformer_hidden_dim: 48
+transformer_heads: 4
+transformer_layers: 2
+transformer_dropout: 0.0
+history_steps: 3
+
+# belief_loss_coef <= 0 enables the no-belief ablation path in code:
+# 1) skip belief loss in the learner
+# 2) replace unseen_enemy_feat with zeros before q_head
+belief_loss_coef: 0.0
+belief_logvar_min: -2.0
+belief_logvar_max: 1.0
+belief_lowrank_rank: 3
+belief_nll_clip: 2.0
+belief_warmup_t: 500000
+
+name: "qmix_history_token_no_belief"
