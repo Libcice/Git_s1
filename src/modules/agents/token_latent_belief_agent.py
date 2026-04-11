@@ -158,7 +158,7 @@ class TokenLatentBeliefAgent(nn.Module):
         current_memory = encoded[:, 0, :]
         enemy_ctx = encoded[:, enemy_start:enemy_end, :]
         ally_ctx = encoded[:, enemy_end:, :]
-        return current_memory, move_feat, self_feat, enemy_ctx, ally_ctx
+        return current_memory, move_feat, self_feat, enemy_feat, ally_feat, enemy_ctx, ally_ctx
 
     def _belief_stats_from_feats(self, enemy_feats):
         belief_mu = self.belief_mu_head(enemy_feats)
@@ -173,9 +173,21 @@ class TokenLatentBeliefAgent(nn.Module):
 
     def forward(self, current_step, prev_memory):
         prev_action_feat = F.relu(self.prev_action_embed(current_step["prev_action"]))
-        current_memory, move_feat, self_feat, enemy_ctx, ally_ctx = self._encode_current_step(current_step, prev_memory)
+        (
+            current_memory,
+            move_feat,
+            self_feat,
+            enemy_feat,
+            ally_feat,
+            enemy_ctx,
+            ally_ctx,
+        ) = self._encode_current_step(current_step, prev_memory)
         prior_aux = self._build_prior_aux(current_step)
 
+        # Keep belief updates on transformer contexts, but let visible ally/enemy
+        # features reach Q through a shorter raw-embedding path.
+        raw_ally_summary = self._masked_mean(ally_feat, current_step["ally_visible"])
+        raw_visible_enemy_summary = self._masked_mean(enemy_feat, current_step["enemy_visible"])
         ally_summary = self._masked_mean(ally_ctx, current_step["ally_visible"])
         visible_enemy_summary = self._masked_mean(enemy_ctx, current_step["enemy_visible"])
         obs_ctx = F.relu(
@@ -228,9 +240,9 @@ class TokenLatentBeliefAgent(nn.Module):
         if self.disable_belief_for_q:
             # Strict no-belief control: Q only uses transformer memory and
             # directly observed context, without posterior-latent modulation.
-            hidden_enemy_summary = torch.zeros_like(visible_enemy_summary)
+            hidden_enemy_summary = torch.zeros_like(raw_visible_enemy_summary)
             q_prefix = torch.cat(
-                [current_memory, move_feat, self_feat, ally_summary, visible_enemy_summary],
+                [current_memory, move_feat, self_feat, raw_ally_summary, raw_visible_enemy_summary],
                 dim=-1,
             )
         else:
@@ -239,7 +251,7 @@ class TokenLatentBeliefAgent(nn.Module):
             hidden_weight = (1.0 - current_step["enemy_visible"].float()) * confidence * importance
             hidden_enemy_summary = self.belief_q_alpha * self._masked_mean(belief_value_feats, hidden_weight)
             q_prefix_base = torch.cat(
-                [current_memory, move_feat, self_feat, ally_summary, visible_enemy_summary],
+                [current_memory, move_feat, self_feat, raw_ally_summary, raw_visible_enemy_summary],
                 dim=-1,
             )
             q_prefix = q_prefix_base * torch.sigmoid(self.q_gate(posterior_latent)) + self.q_bias(posterior_latent)
