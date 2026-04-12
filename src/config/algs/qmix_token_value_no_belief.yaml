@@ -1,0 +1,39 @@
+# --- QMIX + token transformer local value belief no-belief ablation ---
+
+action_selector: "epsilon_greedy"
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 50000
+
+runner: "episode"
+buffer_size: 2000
+target_update_interval: 200
+
+agent_output_type: "q"
+learner: "q_learner_token_value_belief"
+double_q: True
+mixer: "qmix"
+mixing_embed_dim: 32
+hypernet_layers: 2
+hypernet_embed: 64
+
+mac: "token_value_belief_mac"
+agent: "token_value_belief"
+
+transformer_hidden_dim: 48
+transformer_heads: 4
+transformer_layers: 2
+transformer_dropout: 0.0
+record_belief_summary: False
+
+belief_q_warmup_t: 300000
+belief_decay_tau: 6.0
+
+belief_delta_total_coef: 0.0
+belief_delta_slot_coef: 0.0
+belief_rank_coef: 0.0
+belief_aux_coef: 0.0
+belief_teacher_q_coef: 0.0
+belief_delta_warmup_t: 300000
+
+name: "qmix_token_value_no_belief"

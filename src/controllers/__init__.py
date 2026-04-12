@@ -18,6 +18,8 @@ from .token_transformer_belief_controller import TokenTransformerBeliefMAC
 REGISTRY["token_transformer_belief_mac"] = TokenTransformerBeliefMAC
 from .token_latent_belief_controller import TokenLatentBeliefMAC
 REGISTRY["token_latent_belief_mac"] = TokenLatentBeliefMAC
+from .token_value_belief_controller import TokenValueBeliefMAC
+REGISTRY["token_value_belief_mac"] = TokenValueBeliefMAC
 from .token_structured_belief_controller import TokenStructuredBeliefMAC
 REGISTRY["token_structured_belief_mac"] = TokenStructuredBeliefMAC
 

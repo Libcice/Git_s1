@@ -160,13 +160,14 @@ def run_sequential(args, logger):
     scheme = {
         "state": {"vshape": env_info["state_shape"]},
         "obs": {"vshape": env_info["obs_shape"], "group": "agents"},
-        "belief": {"vshape": args.state_shape, "dtype": th.float32, "group": "agents"},
-        # "belief_sigma": {"vshape": args.state_shape, "dtype": th.float32, "group": "agents"},
         "actions": {"vshape": (1,), "group": "agents", "dtype": th.long},
         "avail_actions": {"vshape": (env_info["n_actions"],), "group": "agents", "dtype": th.int},
         "reward": {"vshape": (1,)},
         "terminated": {"vshape": (1,), "dtype": th.uint8},
     }
+    if getattr(args, "record_belief_summary", True):
+        scheme["belief"] = {"vshape": args.state_shape, "dtype": th.float32, "group": "agents"}
+        # scheme["belief_sigma"] = {"vshape": args.state_shape, "dtype": th.float32, "group": "agents"}
     if getattr(args, "is_mappo", False):
         scheme.update({
             "action_log_probs": {"vshape": (1,), "group": "agents", "dtype": th.float32},
