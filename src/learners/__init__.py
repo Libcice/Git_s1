@@ -43,6 +43,14 @@ REGISTRY["q_learner_history_token_belief"] = QLearnerHistoryTokenBelief
 
 from .q_learner_token_belief import QLearnerTokenBelief
 REGISTRY["q_learner_token_belief"] = QLearnerTokenBelief
+from .q_learner_token_latent_belief import QLearnerTokenLatentBelief
+REGISTRY["q_learner_token_latent_belief"] = QLearnerTokenLatentBelief
+from .q_learner_token_value_belief import QLearnerTokenValueBelief
+REGISTRY["q_learner_token_value_belief"] = QLearnerTokenValueBelief
+from .q_learner_token_task_belief import QLearnerTokenTaskBelief
+REGISTRY["q_learner_token_task_belief"] = QLearnerTokenTaskBelief
+from .q_learner_token_structured_belief import QLearnerTokenStructuredBelief
+REGISTRY["q_learner_token_structured_belief"] = QLearnerTokenStructuredBelief
 
 from .q_learner_history_token_rnn_belief import QLearnerHistoryTokenRNNBelief
 REGISTRY["q_learner_history_token_rnn_belief"] = QLearnerHistoryTokenRNNBelief

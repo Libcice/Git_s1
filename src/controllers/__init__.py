@@ -16,6 +16,14 @@ from .history_token_transformer_belief_controller import HistoryTokenTransformer
 REGISTRY["history_token_transformer_belief_mac"] = HistoryTokenTransformerBeliefMAC
 from .token_transformer_belief_controller import TokenTransformerBeliefMAC
 REGISTRY["token_transformer_belief_mac"] = TokenTransformerBeliefMAC
+from .token_latent_belief_controller import TokenLatentBeliefMAC
+REGISTRY["token_latent_belief_mac"] = TokenLatentBeliefMAC
+from .token_value_belief_controller import TokenValueBeliefMAC
+REGISTRY["token_value_belief_mac"] = TokenValueBeliefMAC
+from .token_task_belief_controller import TokenTaskBeliefMAC
+REGISTRY["token_task_belief_mac"] = TokenTaskBeliefMAC
+from .token_structured_belief_controller import TokenStructuredBeliefMAC
+REGISTRY["token_structured_belief_mac"] = TokenStructuredBeliefMAC
 
 from .history_token_rnn_belief_controller import HistoryTokenRNNBeliefMAC
 REGISTRY["history_token_rnn_belief_mac"] = HistoryTokenRNNBeliefMAC

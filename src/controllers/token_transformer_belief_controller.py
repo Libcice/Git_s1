@@ -23,6 +23,8 @@ class TokenTransformerBeliefMAC:
         self.belief_mu = None
         self.belief_logvar = None
         self.belief_u = None
+        self.q_prefix = None
+        self.belief_value_feats = None
 
     def _setup_layout(self, scheme):
         env_args = getattr(self.args, "env_args", {})
@@ -132,12 +134,16 @@ class TokenTransformerBeliefMAC:
         step_tokens, current = self._build_step_tokens(ep_batch, t)
         step_tokens = step_tokens.reshape(bs * self.n_agents, -1, self.token_dim)
         hidden = self.hidden_states.reshape(bs * self.n_agents, -1)
-        agent_outs, new_hidden, belief_mu, belief_logvar, belief_u = self.agent(step_tokens, current, hidden)
+        agent_outs, new_hidden, belief_mu, belief_logvar, belief_u, q_prefix, belief_value_feats = self.agent(
+            step_tokens, current, hidden
+        )
 
         self.hidden_states = new_hidden.view(bs, self.n_agents, -1)
         self.belief_mu = belief_mu.view(bs, self.n_agents, self.args.enemy_num, self.enemy_state_feat_dim)
         self.belief_logvar = belief_logvar.view(bs, self.n_agents, self.args.enemy_num, self.enemy_state_feat_dim)
         self.belief_u = belief_u.view(bs, self.n_agents, self.args.enemy_num, self.enemy_state_feat_dim, -1)
+        self.q_prefix = q_prefix.view(bs, self.n_agents, -1)
+        self.belief_value_feats = belief_value_feats.view(bs, self.n_agents, self.args.enemy_num, -1)
 
         padded_belief = th.zeros(bs, self.n_agents, self.args.state_shape, device=ep_batch.device)
         flat_enemy_belief = self.belief_mu.reshape(bs, self.n_agents, -1)
@@ -151,12 +157,20 @@ class TokenTransformerBeliefMAC:
         self.belief_mu = None
         self.belief_logvar = None
         self.belief_u = None
+        self.q_prefix = None
+        self.belief_value_feats = None
 
     def get_belief(self):
         return self.belief_mu
 
     def get_belief_stats(self):
         return self.belief_mu, self.belief_logvar, self.belief_u
+
+    def get_q_context(self):
+        return self.q_prefix
+
+    def get_belief_value_feats(self):
+        return self.belief_value_feats
 
     def parameters(self):
         return self.agent.parameters()

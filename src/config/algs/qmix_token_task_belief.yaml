@@ -1,0 +1,39 @@
+﻿# --- QMIX + token transformer query-conditioned task belief ---
+
+action_selector: "epsilon_greedy"
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 50000
+
+runner: "episode"
+buffer_size: 2000
+target_update_interval: 200
+
+agent_output_type: "q"
+learner: "q_learner_token_task_belief"
+double_q: True
+mixer: "qmix"
+mixing_embed_dim: 32
+hypernet_layers: 2
+hypernet_embed: 64
+
+mac: "token_task_belief_mac"
+agent: "token_task_belief"
+
+transformer_hidden_dim: 48
+transformer_heads: 4
+transformer_layers: 2
+transformer_dropout: 0.0
+record_belief_summary: False
+
+belief_loss_warmup_t: 300000
+belief_latent_align_coef: 0.0
+belief_attn_align_coef: 0.10
+belief_context_align_coef: 0.10
+belief_teacher_q_coef: 0.05
+belief_reappear_coef: 0.10
+belief_teacher_mode: "loo_q"
+belief_teacher_loo_topk: 3
+belief_topk: 3
+
+name: "qmix_token_task_belief"

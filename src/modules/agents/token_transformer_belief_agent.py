@@ -95,15 +95,14 @@ class TokenTransformerBeliefAgent(nn.Module):
             F.relu(self.token_embed(current_step["enemy_tokens"])),
             current_step["enemy_visible"],
         )
+        belief_value_feats = F.relu(self.belief_enemy_proj(belief_mu))
         unseen_enemy_feat = self._masked_mean(
-            F.relu(self.belief_enemy_proj(belief_mu)),
+            belief_value_feats,
             1.0 - current_step["enemy_visible"].float(),
         )
 
-        q_input = torch.cat(
-            [memory, move_feat, self_feat, ally_feat, visible_enemy_feat, unseen_enemy_feat],
-            dim=-1,
-        )
+        q_prefix = torch.cat([memory, move_feat, self_feat, ally_feat, visible_enemy_feat], dim=-1)
+        q_input = torch.cat([q_prefix, unseen_enemy_feat], dim=-1)
         q = self.q_head(q_input)
 
-        return q, memory, belief_mu, belief_logvar, belief_u
+        return q, memory, belief_mu, belief_logvar, belief_u, q_prefix, belief_value_feats
