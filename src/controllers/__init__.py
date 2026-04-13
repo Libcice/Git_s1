@@ -34,7 +34,3 @@ from .belief_slot_transformer_controller import BeliefSlotTransformerMAC
 REGISTRY["belief_slot_transformer_mac"] = BeliefSlotTransformerMAC
 from .history_slot_belief_controller import HistorySlotBeliefMAC
 REGISTRY["history_slot_belief_mac"] = HistorySlotBeliefMAC
-
-from .TrXL_belief_controller import TrXLBeliefMAC
-REGISTRY["TrXL_belief_mac"] = TrXLBeliefMAC
-REGISTRY["trxl_belief_mac"] = TrXLBeliefMAC
