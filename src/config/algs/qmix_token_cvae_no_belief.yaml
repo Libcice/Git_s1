@@ -1,0 +1,43 @@
+# --- QMIX + token-history encoder + CVAE path ablation ---
+
+action_selector: "epsilon_greedy"
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 50000
+
+runner: "episode"
+buffer_size: 2000
+target_update_interval: 200
+
+agent_output_type: "q"
+learner: "q_learner_token_cvae_belief"
+double_q: True
+mixer: "qmix"
+mixing_embed_dim: 32
+hypernet_layers: 2
+hypernet_embed: 64
+
+mac: "token_cvae_belief_mac"
+agent: "token_cvae_belief"
+
+transformer_hidden_dim: 48
+transformer_heads: 4
+transformer_layers: 2
+transformer_dropout: 0.0
+
+# Strict no-belief ablation:
+# - disable belief loss / KL
+# - disable belief replacement into Q even if another flag is mis-set
+belief_prior_type: "conditional"
+belief_latent_dim: 16
+belief_loss_coef: 0.0
+belief_kl_coef: 0.0
+belief_logvar_min: -3.0
+belief_logvar_max: 1.0
+belief_warmup_t: 300000
+belief_pretrain_t: 0
+belief_pretrain_only: False
+disable_belief: True
+use_belief_for_q: False
+
+name: "qmix_token_cvae_no_belief"
