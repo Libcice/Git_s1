@@ -51,12 +51,8 @@ from .q_learner_token_cvae_belief import QLearnerTokenCVAEBelief
 REGISTRY["q_learner_token_cvae_belief"] = QLearnerTokenCVAEBelief
 from .q_learner_token_latent_belief import QLearnerTokenLatentBelief
 REGISTRY["q_learner_token_latent_belief"] = QLearnerTokenLatentBelief
-try:
-    from .q_learner_token_latent_residual_belief import QLearnerTokenLatentResidualBelief
-except Exception:
-    QLearnerTokenLatentResidualBelief = None
-if QLearnerTokenLatentResidualBelief is not None:
-    REGISTRY["q_learner_token_latent_residual_belief"] = QLearnerTokenLatentResidualBelief
+from .q_learner_token_latent_residual_belief import QLearnerTokenLatentResidualBelief
+REGISTRY["q_learner_token_latent_residual_belief"] = QLearnerTokenLatentResidualBelief
 from .q_learner_token_structured_belief import QLearnerTokenStructuredBelief
 REGISTRY["q_learner_token_structured_belief"] = QLearnerTokenStructuredBelief
 

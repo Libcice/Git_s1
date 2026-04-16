@@ -28,13 +28,10 @@ transformer_dropout: 0.0
 belief_prior_type: "conditional"
 belief_latent_dim: 16
 belief_loss_coef: 0.05
-belief_posterior_coef: 0.25
 belief_kl_coef: 0.1
 belief_logvar_min: -3.0
 belief_logvar_max: 1.0
-belief_nll_clip: 2.0
 belief_warmup_t: 300000
-belief_kl_warmup_t: 300000
 belief_pretrain_t: 50000
 belief_pretrain_only: False
 disable_belief: False

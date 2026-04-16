@@ -39,6 +39,16 @@ class TokenCVAEBeliefAgent(nn.Module):
         self.belief_prior_type = getattr(args, "belief_prior_type", "conditional")
         self.belief_logvar_min = getattr(args, "belief_logvar_min", -2.0)
         self.belief_logvar_max = getattr(args, "belief_logvar_max", 1.0)
+        default_conf_temp = 0.25 * max(1e-6, self.belief_logvar_max - self.belief_logvar_min)
+        self.belief_confidence_center = getattr(
+            args,
+            "belief_confidence_center",
+            0.5 * (self.belief_logvar_min + self.belief_logvar_max),
+        )
+        self.belief_confidence_temp = max(
+            1e-6,
+            float(getattr(args, "belief_confidence_temp", default_conf_temp)),
+        )
 
         if self.hidden_dim % self.n_heads != 0:
             raise ValueError("transformer_hidden_dim must be divisible by transformer_heads")
@@ -151,6 +161,15 @@ class TokenCVAEBeliefAgent(nn.Module):
         belief_logvar = self.decoder_logvar(decoder_hidden).view(-1, self.n_enemies, self.enemy_state_feat_dim)
         return belief_mu, belief_logvar
 
+    def _belief_confidence(self, belief_logvar):
+        avg_logvar = belief_logvar.clamp(
+            min=self.belief_logvar_min,
+            max=self.belief_logvar_max,
+        ).mean(dim=-1, keepdim=True)
+        return th.sigmoid(
+            (self.belief_confidence_center - avg_logvar) / self.belief_confidence_temp
+        )
+
     def _posterior_latent(self, history_context, hidden_enemy_state):
         hidden_flat = hidden_enemy_state.reshape(hidden_enemy_state.size(0), -1)
         posterior_stats = self.posterior_encoder(th.cat([history_context, hidden_flat], dim=-1))
@@ -186,12 +205,7 @@ class TokenCVAEBeliefAgent(nn.Module):
         if self.belief_prior_type == "standard_normal":
             prior_belief_conf = prior_belief_mu.new_ones(prior_belief_mu.size(0), self.n_enemies, 1)
         else:
-            prior_belief_conf = th.exp(
-                -0.5
-                * prior_belief_logvar.clamp(min=self.belief_logvar_min, max=self.belief_logvar_max).mean(
-                    dim=-1, keepdim=True
-                )
-            ).clamp(max=1.0)
+            prior_belief_conf = self._belief_confidence(prior_belief_logvar)
         prior_belief_feat = F.relu(self.belief_enemy_proj(prior_belief_mu)) * prior_belief_conf
 
         if self.use_belief_for_q:
