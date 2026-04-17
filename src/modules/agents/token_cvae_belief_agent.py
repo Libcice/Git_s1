@@ -84,7 +84,10 @@ class TokenCVAEBeliefAgent(nn.Module):
 
         self.real_enemy_proj = _build_mlp(self.hidden_dim, self.hidden_dim, self.hidden_dim)
         self.belief_enemy_proj = _build_mlp(self.enemy_state_feat_dim, self.hidden_dim, self.hidden_dim)
-        self.q_head = nn.Linear(self.hidden_dim * 2, args.n_actions)
+        self.hidden_feature_gate_proj = _build_mlp(6, self.hidden_dim, 1)
+        self.slot_fusion_proj = _build_mlp(self.hidden_dim * 2 + 6, self.hidden_dim * 2, self.hidden_dim)
+        self.enemy_summary_proj = _build_mlp(self.n_enemies * self.hidden_dim, self.hidden_dim * 2, self.hidden_dim)
+        self.q_head = _build_mlp(self.hidden_dim * 2, self.hidden_dim * 2, args.n_actions)
 
         if self.belief_prior_type == "conditional":
             self.prior_encoder = _build_mlp(self.hidden_dim, self.hidden_dim * 2, self.latent_dim * 2)
@@ -111,10 +114,19 @@ class TokenCVAEBeliefAgent(nn.Module):
         return (feats * mask).sum(dim=1) / denom
 
     def _reparameterize(self, mu, logvar):
+        # Keep a defensive clamp here even though all learned logvars are bounded upstream.
         logvar = logvar.clamp(min=self.belief_logvar_min, max=self.belief_logvar_max)
         std = th.exp(0.5 * logvar)
         eps = th.randn_like(std)
         return mu + eps * std
+
+    def _bound_logvar(self, raw_logvar):
+        span = max(1e-6, self.belief_logvar_max - self.belief_logvar_min)
+        return self.belief_logvar_min + span * th.sigmoid(raw_logvar)
+
+    def _split_bounded_stats(self, stats):
+        mu, raw_logvar = th.chunk(stats, 2, dim=-1)
+        return mu, self._bound_logvar(raw_logvar)
 
     def _encode_current_step(self, current_step, prev_memory):
         move_feat = F.relu(self.token_embed(current_step["move_token"]))
@@ -152,13 +164,16 @@ class TokenCVAEBeliefAgent(nn.Module):
             prior_logvar = history_context.new_zeros(history_context.size(0), self.latent_dim)
         else:
             prior_stats = self.prior_encoder(history_context)
-            prior_mu, prior_logvar = th.chunk(prior_stats, 2, dim=-1)
+            prior_mu, prior_logvar = self._split_bounded_stats(prior_stats)
         return prior_mu, prior_logvar
 
     def _decode_belief(self, history_context, latent_z):
         decoder_hidden = self.decoder_trunk(th.cat([history_context, latent_z], dim=-1))
         belief_mu = self.decoder_mu(decoder_hidden).view(-1, self.n_enemies, self.enemy_state_feat_dim)
-        belief_logvar = self.decoder_logvar(decoder_hidden).view(-1, self.n_enemies, self.enemy_state_feat_dim)
+        # Bound uncertainty at the source so downstream code never sees out-of-range logvars.
+        belief_logvar = self._bound_logvar(
+            self.decoder_logvar(decoder_hidden).view(-1, self.n_enemies, self.enemy_state_feat_dim)
+        )
         return belief_mu, belief_logvar
 
     def _belief_confidence(self, belief_logvar):
@@ -173,7 +188,7 @@ class TokenCVAEBeliefAgent(nn.Module):
     def _posterior_latent(self, history_context, hidden_enemy_state):
         hidden_flat = hidden_enemy_state.reshape(hidden_enemy_state.size(0), -1)
         posterior_stats = self.posterior_encoder(th.cat([history_context, hidden_flat], dim=-1))
-        posterior_mu, posterior_logvar = th.chunk(posterior_stats, 2, dim=-1)
+        posterior_mu, posterior_logvar = self._split_bounded_stats(posterior_stats)
         return posterior_mu, posterior_logvar
 
     def forward(self, current_step, prev_memory, hidden_enemy_state=None):
@@ -208,16 +223,57 @@ class TokenCVAEBeliefAgent(nn.Module):
             prior_belief_conf = self._belief_confidence(prior_belief_logvar)
         prior_belief_feat = F.relu(self.belief_enemy_proj(prior_belief_mu)) * prior_belief_conf
 
-        if self.use_belief_for_q:
-            fused_enemy_feat = current_step["enemy_visible"].unsqueeze(-1).float() * real_enemy_feat + (
-                1.0 - current_step["enemy_visible"].unsqueeze(-1).float()
-            ) * prior_belief_feat
-        else:
-            fused_enemy_feat = current_step["enemy_visible"].unsqueeze(-1).float() * real_enemy_feat
+        visible_mask = current_step["enemy_visible"].float().unsqueeze(-1)
+        hidden_mask = 1.0 - visible_mask
+        visible_frac = current_step["enemy_visible"].float().mean(dim=1, keepdim=True)
+        hidden_frac = hidden_mask.squeeze(-1).mean(dim=1, keepdim=True)
+        hidden_prior_conf_summary = self._masked_mean(prior_belief_conf, hidden_mask.squeeze(-1))
+        belief_conf_slots = prior_belief_conf
 
-        enemy_mask = th.ones_like(current_step["enemy_visible"])
-        enemy_summary = self._masked_mean(fused_enemy_feat, enemy_mask)
-        enemy_attn = enemy_mask / enemy_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        visible_enemy_slots = visible_mask * real_enemy_feat
+        hidden_frac_broadcast = hidden_frac.unsqueeze(1).expand(-1, self.n_enemies, -1)
+        visible_frac_broadcast = visible_frac.unsqueeze(1).expand(-1, self.n_enemies, -1)
+        hidden_prior_conf_summary_broadcast = hidden_prior_conf_summary.unsqueeze(1).expand(-1, self.n_enemies, -1)
+
+        hidden_feature_gate_input = th.cat(
+            [
+                prior_belief_conf,
+                hidden_prior_conf_summary_broadcast,
+                visible_mask,
+                hidden_mask,
+                visible_frac_broadcast,
+                hidden_frac_broadcast,
+            ],
+            dim=-1,
+        )
+        if self.use_belief_for_q:
+            hidden_feature_gate = hidden_mask * th.sigmoid(self.hidden_feature_gate_proj(hidden_feature_gate_input))
+            hidden_feature_used = hidden_feature_gate * prior_belief_feat
+        else:
+            hidden_feature_gate = hidden_mask.new_zeros(hidden_mask.shape)
+            hidden_feature_used = prior_belief_feat.new_zeros(prior_belief_feat.shape)
+            belief_conf_slots = prior_belief_conf.new_zeros(prior_belief_conf.shape)
+            hidden_prior_conf_summary = hidden_prior_conf_summary.new_zeros(hidden_prior_conf_summary.shape)
+            hidden_prior_conf_summary_broadcast = hidden_prior_conf_summary_broadcast.new_zeros(
+                hidden_prior_conf_summary_broadcast.shape
+            )
+
+        slot_fusion_input = th.cat(
+            [
+                visible_enemy_slots,
+                hidden_feature_used,
+                visible_mask,
+                hidden_mask,
+                belief_conf_slots,
+                hidden_prior_conf_summary_broadcast,
+                visible_frac_broadcast,
+                hidden_frac_broadcast,
+            ],
+            dim=-1,
+        )
+        fused_enemy_feat = self.slot_fusion_proj(slot_fusion_input)
+        # Preserve enemy-slot order until the final compression step so Q can still distinguish slots.
+        enemy_summary = self.enemy_summary_proj(fused_enemy_feat.reshape(fused_enemy_feat.size(0), -1))
         q = self.q_head(th.cat([q_context, enemy_summary], dim=-1))
 
         posterior_belief_mu = None
@@ -240,9 +296,7 @@ class TokenCVAEBeliefAgent(nn.Module):
             prior_z_logvar,
             posterior_z_mu,
             posterior_z_logvar,
-            q_context,
-            enemy_summary,
-            fused_enemy_feat,
-            enemy_attn,
             prior_belief_conf,
+            hidden_feature_gate,
+            hidden_feature_used,
         )
