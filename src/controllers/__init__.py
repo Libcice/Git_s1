@@ -22,6 +22,8 @@ from .token_cvae_belief_controller import TokenCVAEBeliefMAC
 REGISTRY["token_cvae_belief_mac"] = TokenCVAEBeliefMAC
 from .token_value_belief_controller import TokenValueBeliefMAC
 REGISTRY["token_value_belief_mac"] = TokenValueBeliefMAC
+from .token_value_cvae_belief_controller import TokenValueCVAEBeliefMAC
+REGISTRY["token_value_cvae_belief_mac"] = TokenValueCVAEBeliefMAC
 from .token_task_belief_controller import TokenTaskBeliefMAC
 REGISTRY["token_task_belief_mac"] = TokenTaskBeliefMAC
 from .token_structured_belief_controller import TokenStructuredBeliefMAC

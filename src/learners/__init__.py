@@ -51,6 +51,10 @@ from .q_learner_token_cvae_belief import QLearnerTokenCVAEBelief
 REGISTRY["q_learner_token_cvae_belief"] = QLearnerTokenCVAEBelief
 from .q_learner_token_latent_belief import QLearnerTokenLatentBelief
 REGISTRY["q_learner_token_latent_belief"] = QLearnerTokenLatentBelief
+from .q_learner_token_value_belief import QLearnerTokenValueBelief
+REGISTRY["q_learner_token_value_belief"] = QLearnerTokenValueBelief
+from .q_learner_token_value_cvae_belief import QLearnerTokenValueCVAEBelief
+REGISTRY["q_learner_token_value_cvae_belief"] = QLearnerTokenValueCVAEBelief
 try:
     from .q_learner_token_latent_residual_belief import QLearnerTokenLatentResidualBelief
 except Exception:
