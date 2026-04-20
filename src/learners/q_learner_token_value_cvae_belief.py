@@ -1,4 +1,5 @@
 import copy
+import math
 import os
 
 from components.episode_buffer import EpisodeBatch
@@ -47,10 +48,13 @@ class QLearnerTokenValueCVAEBelief:
 
         self.hidden_dim = getattr(self.args, "transformer_hidden_dim", self.args.rnn_hidden_dim)
         self.belief_loss_coef = getattr(self.args, "belief_loss_coef", 0.05)
+        self.belief_posterior_coef = getattr(self.args, "belief_posterior_coef", 0.25)
         self.belief_kl_coef = getattr(self.args, "belief_kl_coef", 0.1)
         self.belief_logvar_min = getattr(self.args, "belief_logvar_min", -3.0)
         self.belief_logvar_max = getattr(self.args, "belief_logvar_max", 1.0)
+        self.belief_nll_clip = getattr(self.args, "belief_nll_clip", 2.0)
         self.belief_warmup_t = getattr(self.args, "belief_warmup_t", 300000)
+        self.belief_kl_warmup_t = getattr(self.args, "belief_kl_warmup_t", self.belief_warmup_t)
         self.belief_pretrain_t = getattr(self.args, "belief_pretrain_t", 50000)
         self.belief_pretrain_only = getattr(self.args, "belief_pretrain_only", False)
 
@@ -104,22 +108,33 @@ class QLearnerTokenValueCVAEBelief:
         self.target_mac = copy.deepcopy(mac)
         self.log_stats_t = -self.args.learner_log_interval - 1
 
-    def _gaussian_nll(self, target, mu, logvar):
+    def _smooth_ramp(self, progress):
+        progress = max(0.0, min(1.0, float(progress)))
+        return 0.5 - 0.5 * math.cos(math.pi * progress)
+
+    def _stabilized_gaussian_nll(self, target, mu, logvar):
         logvar = logvar.clamp(min=self.belief_logvar_min, max=self.belief_logvar_max)
         inv_var = th.exp(-logvar)
-        return 0.5 * (((target - mu) ** 2) * inv_var + logvar).sum(dim=-1)
+        per_dim_nll = 0.5 * (((target - mu) ** 2) * inv_var + logvar + math.log(2.0 * math.pi))
+        raw_nll = per_dim_nll.mean(dim=-1)
+        nll_floor = 0.5 * (self.belief_logvar_min + math.log(2.0 * math.pi))
+        stable_nll = (raw_nll - nll_floor).clamp(min=0.0, max=self.belief_nll_clip)
+        return raw_nll, stable_nll
 
     def _kl_divergence(self, post_mu, post_logvar, prior_mu, prior_logvar):
         post_logvar = post_logvar.clamp(min=self.belief_logvar_min, max=self.belief_logvar_max)
         prior_logvar = prior_logvar.clamp(min=self.belief_logvar_min, max=self.belief_logvar_max)
 
         if self.belief_prior_type == "standard_normal":
-            return 0.5 * (th.exp(post_logvar) + post_mu.pow(2) - 1.0 - post_logvar).sum(dim=-1)
+            kl = 0.5 * (th.exp(post_logvar) + post_mu.pow(2) - 1.0 - post_logvar).sum(dim=-1)
+        else:
+            diff = post_mu - prior_mu
+            kl = 0.5 * (
+                prior_logvar - post_logvar + (th.exp(post_logvar) + diff.pow(2)) * th.exp(-prior_logvar) - 1.0
+            ).sum(dim=-1)
 
-        diff = post_mu - prior_mu
-        return 0.5 * (
-            prior_logvar - post_logvar + (th.exp(post_logvar) + diff.pow(2)) * th.exp(-prior_logvar) - 1.0
-        ).sum(dim=-1)
+        latent_dim = float(max(1, getattr(self.args, "belief_latent_dim", 1)))
+        return kl / latent_dim
 
     def _masked_mean(self, feats, mask):
         if feats.size(1) == 0:
@@ -136,7 +151,7 @@ class QLearnerTokenValueCVAEBelief:
         mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
         avail_actions = batch["avail_actions"]
 
-        belief_pretraining_active = (self.belief_loss_coef > 0.0) and (t_env < self.belief_pretrain_t)
+        belief_pretraining_active = self.belief_pretrain_only and (t_env < self.belief_pretrain_t)
         q_learning_active = (not self.belief_pretrain_only) or (t_env >= self.belief_pretrain_t)
         if q_learning_active and not self.q_learning_started:
             self._update_targets()
@@ -177,15 +192,15 @@ class QLearnerTokenValueCVAEBelief:
         repr_loss_denom = rewards.new_tensor(0.0)
         aux_delta_q_loss_sum = rewards.new_tensor(0.0)
         aux_delta_q_loss_denom = rewards.new_tensor(0.0)
+        prior_raw_nll_sum = rewards.new_tensor(0.0)
+        prior_raw_nll_denom = rewards.new_tensor(0.0)
+        post_raw_nll_sum = rewards.new_tensor(0.0)
+        post_raw_nll_denom = rewards.new_tensor(0.0)
         teacher_q_loss = rewards.new_tensor(0.0)
         teacher_q_weight = 0.0
         repr_weight = 0.0
         aux_delta_q_weight = 0.0
         value_warm = min(1.0, float(t_env) / float(max(1, self.belief_value_warmup_t)))
-        belief_warm = 1.0 if belief_pretraining_active else min(
-            1.0,
-            float(max(1, t_env - self.belief_pretrain_t + 1)) / float(max(1, self.belief_warmup_t)),
-        )
 
         enemy_obs_start = self.move_dim
         enemy_obs_end = enemy_obs_start + self.args.enemy_num * self.enemy_obs_feat_dim
@@ -294,12 +309,24 @@ class QLearnerTokenValueCVAEBelief:
                     self.args.enemy_num,
                     self.enemy_state_feat_dim,
                 )
-                posterior_nll_t = self._gaussian_nll(hidden_enemy_view, posterior_state_mu_view, posterior_state_logvar_view)
-                prior_nll_t = self._gaussian_nll(hidden_enemy_view, prior_state_mu_view, prior_state_logvar_view)
+                posterior_raw_nll_t, posterior_nll_t = self._stabilized_gaussian_nll(
+                    hidden_enemy_view,
+                    posterior_state_mu_view,
+                    posterior_state_logvar_view,
+                )
+                prior_raw_nll_t, prior_nll_t = self._stabilized_gaussian_nll(
+                    hidden_enemy_view,
+                    prior_state_mu_view,
+                    prior_state_logvar_view,
+                )
                 belief_recon_sum = belief_recon_sum + (posterior_nll_t * hidden_mask_t).sum()
                 belief_recon_denom = belief_recon_denom + hidden_mask_t.sum()
                 belief_prior_nll_sum = belief_prior_nll_sum + (prior_nll_t * hidden_mask_t).sum()
                 belief_prior_nll_denom = belief_prior_nll_denom + hidden_mask_t.sum()
+                post_raw_nll_sum = post_raw_nll_sum + (posterior_raw_nll_t * hidden_mask_t).sum()
+                post_raw_nll_denom = post_raw_nll_denom + hidden_mask_t.sum()
+                prior_raw_nll_sum = prior_raw_nll_sum + (prior_raw_nll_t * hidden_mask_t).sum()
+                prior_raw_nll_denom = prior_raw_nll_denom + hidden_mask_t.sum()
 
                 kl_t = self._kl_divergence(posterior_z_mu_t, posterior_z_logvar_t, prior_z_mu_t, prior_z_logvar_t)
                 belief_kl_sum = belief_kl_sum + (kl_t * hidden_present_t).sum()
@@ -506,10 +533,11 @@ class QLearnerTokenValueCVAEBelief:
             )
             teacher_q_weight = self.belief_teacher_q_coef * value_warm
 
-        belief_recon_loss = belief_recon_sum / belief_recon_denom.clamp(min=1.0)
-        belief_prior_nll = belief_prior_nll_sum / belief_prior_nll_denom.clamp(min=1.0)
+        belief_post_loss = belief_recon_sum / belief_recon_denom.clamp(min=1.0)
+        belief_prior_loss = belief_prior_nll_sum / belief_prior_nll_denom.clamp(min=1.0)
+        belief_post_raw_nll = post_raw_nll_sum / post_raw_nll_denom.clamp(min=1.0)
+        belief_prior_raw_nll = prior_raw_nll_sum / prior_raw_nll_denom.clamp(min=1.0)
         belief_kl_loss = belief_kl_sum / belief_kl_denom.clamp(min=1.0)
-        belief_loss = belief_recon_loss + self.belief_kl_coef * belief_kl_loss
         repr_loss = repr_loss_sum / repr_loss_denom.clamp(min=1.0)
         aux_delta_q_loss = aux_delta_q_loss_sum / aux_delta_q_loss_denom.clamp(min=1.0)
 
@@ -517,14 +545,31 @@ class QLearnerTokenValueCVAEBelief:
             teacher_q_weight = 0.0
         repr_weight = self.belief_repr_coef * value_warm if mac_value_active else 0.0
         aux_delta_q_weight = self.belief_aux_delta_q_coef * value_warm if mac_value_active else 0.0
-        belief_weight = self.belief_loss_coef * belief_warm if self.belief_loss_coef > 0.0 else 0.0
+        kl_progress = min(1.0, float(max(1, t_env)) / float(max(1, self.belief_kl_warmup_t)))
+        belief_kl_weight = self.belief_kl_coef * self._smooth_ramp(kl_progress)
+        if self.belief_pretrain_only:
+            if t_env < self.belief_pretrain_t:
+                belief_weight = self._smooth_ramp(float(max(0, t_env)) / float(max(1, self.belief_pretrain_t)))
+            else:
+                post_progress = min(
+                    1.0,
+                    float(max(0, t_env - self.belief_pretrain_t)) / float(max(1, self.belief_warmup_t)),
+                )
+                belief_weight = self.belief_loss_coef + (1.0 - self.belief_loss_coef) * (1.0 - self._smooth_ramp(post_progress))
+        else:
+            warmup_progress = min(1.0, float(max(0, t_env)) / float(max(1, self.belief_warmup_t)))
+            belief_weight = self.belief_loss_coef * self._smooth_ramp(warmup_progress) if self.belief_loss_coef > 0.0 else 0.0
+        belief_loss = belief_prior_loss + self.belief_posterior_coef * belief_post_loss + belief_kl_weight * belief_kl_loss
+        belief_weighted_loss = belief_weight * belief_loss
+        belief_effective_post_weight = belief_weight * self.belief_posterior_coef
+        belief_effective_kl_weight = belief_weight * belief_kl_weight
 
         if not q_learning_active and belief_weight == 0.0 and teacher_q_weight == 0.0 and repr_weight == 0.0 and aux_delta_q_weight == 0.0:
             return
 
         loss = (
             q_loss
-            + belief_weight * belief_loss
+            + belief_weighted_loss
             + teacher_q_weight * teacher_q_loss
             + repr_weight * repr_loss
             + aux_delta_q_weight * aux_delta_q_loss
@@ -543,10 +588,23 @@ class QLearnerTokenValueCVAEBelief:
             self.logger.log_stat("loss", loss.item(), t_env)
             self.logger.log_stat("q_loss", q_loss.item(), t_env)
             self.logger.log_stat("belief_loss", belief_loss.item(), t_env)
-            self.logger.log_stat("belief_recon_loss", belief_recon_loss.item(), t_env)
-            self.logger.log_stat("belief_prior_nll", belief_prior_nll.item(), t_env)
+            self.logger.log_stat("belief_weighted_loss", belief_weighted_loss.item(), t_env)
+            self.logger.log_stat(
+                "belief_weighted_q_ratio",
+                abs(belief_weighted_loss.item()) / (q_loss.item() + 1e-6) if q_learning_active else 0.0,
+                t_env,
+            )
+            self.logger.log_stat("belief_recon_loss", belief_post_loss.item(), t_env)
+            self.logger.log_stat("belief_post_loss", belief_post_loss.item(), t_env)
+            self.logger.log_stat("belief_prior_nll", belief_prior_loss.item(), t_env)
+            self.logger.log_stat("belief_prior_loss", belief_prior_loss.item(), t_env)
+            self.logger.log_stat("belief_post_raw_nll", belief_post_raw_nll.item(), t_env)
+            self.logger.log_stat("belief_prior_raw_nll", belief_prior_raw_nll.item(), t_env)
             self.logger.log_stat("belief_kl_loss", belief_kl_loss.item(), t_env)
+            self.logger.log_stat("belief_kl_weight", belief_kl_weight, t_env)
             self.logger.log_stat("belief_weight", belief_weight, t_env)
+            self.logger.log_stat("belief_effective_post_weight", belief_effective_post_weight, t_env)
+            self.logger.log_stat("belief_effective_kl_weight", belief_effective_kl_weight, t_env)
             self.logger.log_stat("belief_teacher_q_loss", teacher_q_loss.item(), t_env)
             self.logger.log_stat("belief_teacher_q_weight", teacher_q_weight, t_env)
             self.logger.log_stat("belief_repr_loss", repr_loss.item(), t_env)

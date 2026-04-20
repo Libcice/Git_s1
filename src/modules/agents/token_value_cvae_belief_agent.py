@@ -39,6 +39,16 @@ class TokenValueCVAEBeliefAgent(nn.Module):
         self.belief_prior_type = getattr(args, "belief_prior_type", "conditional")
         self.belief_logvar_min = getattr(args, "belief_logvar_min", -2.0)
         self.belief_logvar_max = getattr(args, "belief_logvar_max", 1.0)
+        default_conf_temp = 0.25 * max(1e-6, self.belief_logvar_max - self.belief_logvar_min)
+        self.belief_confidence_center = getattr(
+            args,
+            "belief_confidence_center",
+            0.5 * (self.belief_logvar_min + self.belief_logvar_max),
+        )
+        self.belief_confidence_temp = max(
+            1e-6,
+            float(getattr(args, "belief_confidence_temp", default_conf_temp)),
+        )
 
         if self.hidden_dim % self.n_heads != 0:
             raise ValueError("transformer_hidden_dim must be divisible by transformer_heads")
@@ -111,6 +121,23 @@ class TokenValueCVAEBeliefAgent(nn.Module):
         eps = th.randn_like(std)
         return mu + eps * std
 
+    def _bound_logvar(self, raw_logvar):
+        span = max(1e-6, self.belief_logvar_max - self.belief_logvar_min)
+        return self.belief_logvar_min + span * th.sigmoid(raw_logvar)
+
+    def _split_bounded_stats(self, stats):
+        mu, raw_logvar = th.chunk(stats, 2, dim=-1)
+        return mu, self._bound_logvar(raw_logvar)
+
+    def _belief_confidence(self, belief_logvar):
+        avg_logvar = belief_logvar.clamp(
+            min=self.belief_logvar_min,
+            max=self.belief_logvar_max,
+        ).mean(dim=-1, keepdim=True)
+        return th.sigmoid(
+            (self.belief_confidence_center - avg_logvar) / self.belief_confidence_temp
+        )
+
     def _encode_current_step(self, current_step, prev_memory):
         move_feat = F.relu(self.token_embed(current_step["move_token"]))
         self_feat = F.relu(self.token_embed(current_step["self_token"]))
@@ -147,19 +174,21 @@ class TokenValueCVAEBeliefAgent(nn.Module):
             prior_logvar = history_context.new_zeros(history_context.size(0), self.latent_dim)
         else:
             prior_stats = self.prior_encoder(history_context)
-            prior_mu, prior_logvar = th.chunk(prior_stats, 2, dim=-1)
+            prior_mu, prior_logvar = self._split_bounded_stats(prior_stats)
         return prior_mu, prior_logvar
 
     def _decode_belief(self, history_context, latent_z):
         decoder_hidden = self.decoder_trunk(th.cat([history_context, latent_z], dim=-1))
         belief_mu = self.decoder_mu(decoder_hidden).view(-1, self.n_enemies, self.enemy_state_feat_dim)
-        belief_logvar = self.decoder_logvar(decoder_hidden).view(-1, self.n_enemies, self.enemy_state_feat_dim)
+        belief_logvar = self._bound_logvar(
+            self.decoder_logvar(decoder_hidden).view(-1, self.n_enemies, self.enemy_state_feat_dim)
+        )
         return belief_mu, belief_logvar
 
     def _posterior_latent(self, history_context, hidden_enemy_state):
         hidden_flat = hidden_enemy_state.reshape(hidden_enemy_state.size(0), -1)
         posterior_stats = self.posterior_encoder(th.cat([history_context, hidden_flat], dim=-1))
-        posterior_mu, posterior_logvar = th.chunk(posterior_stats, 2, dim=-1)
+        posterior_mu, posterior_logvar = self._split_bounded_stats(posterior_stats)
         return posterior_mu, posterior_logvar
 
     def forward(self, current_step, prev_memory, hidden_enemy_state=None):
@@ -190,12 +219,7 @@ class TokenValueCVAEBeliefAgent(nn.Module):
         if self.belief_prior_type == "standard_normal":
             prior_belief_conf = prior_belief_mu.new_ones(prior_belief_mu.size(0), self.n_enemies, 1)
         else:
-            prior_belief_conf = th.exp(
-                -0.5
-                * prior_belief_logvar.clamp(min=self.belief_logvar_min, max=self.belief_logvar_max).mean(
-                    dim=-1, keepdim=True
-                )
-            ).clamp(max=1.0)
+            prior_belief_conf = self._belief_confidence(prior_belief_logvar)
         prior_belief_feat = F.relu(self.belief_enemy_proj(prior_belief_mu)) * prior_belief_conf
 
         visible_enemy_feat = current_step["enemy_visible"].unsqueeze(-1).float() * real_enemy_feat
