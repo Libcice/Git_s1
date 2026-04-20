@@ -126,54 +126,18 @@ class QLearnerTokenCVAEBelief:
         belief_prior_denom = rewards.new_tensor(0.0)
         belief_post_sum = rewards.new_tensor(0.0)
         belief_post_denom = rewards.new_tensor(0.0)
-        belief_prior_nll_sum = rewards.new_tensor(0.0)
-        belief_prior_nll_denom = rewards.new_tensor(0.0)
         belief_kl_sum = rewards.new_tensor(0.0)
         belief_kl_denom = rewards.new_tensor(0.0)
-        belief_prior_raw_sum = rewards.new_tensor(0.0)
-        belief_prior_raw_count = rewards.new_tensor(0.0)
-        belief_post_raw_sum = rewards.new_tensor(0.0)
-        belief_post_raw_count = rewards.new_tensor(0.0)
-        belief_visible_frac_sum = rewards.new_tensor(0.0)
-        belief_visible_frac_count = rewards.new_tensor(0.0)
-        belief_hidden_frac_sum = rewards.new_tensor(0.0)
-        belief_hidden_frac_count = rewards.new_tensor(0.0)
-        belief_hidden_present_sum = rewards.new_tensor(0.0)
-        belief_hidden_present_count = rewards.new_tensor(0.0)
         belief_alive_visible_frac_sum = rewards.new_tensor(0.0)
         belief_alive_visible_frac_count = rewards.new_tensor(0.0)
         belief_alive_hidden_frac_sum = rewards.new_tensor(0.0)
         belief_alive_hidden_frac_count = rewards.new_tensor(0.0)
         belief_alive_hidden_present_sum = rewards.new_tensor(0.0)
         belief_alive_hidden_present_count = rewards.new_tensor(0.0)
-        hidden_feature_gate_sum = rewards.new_tensor(0.0)
-        hidden_feature_gate_count = rewards.new_tensor(0.0)
-        hidden_feature_gate_hidden_sum = rewards.new_tensor(0.0)
-        hidden_feature_gate_hidden_count = rewards.new_tensor(0.0)
         hidden_feature_gate_alive_hidden_sum = rewards.new_tensor(0.0)
         hidden_feature_gate_alive_hidden_count = rewards.new_tensor(0.0)
-        hidden_feature_used_abs_sum = rewards.new_tensor(0.0)
-        hidden_feature_used_abs_count = rewards.new_tensor(0.0)
-        hidden_feature_used_hidden_abs_sum = rewards.new_tensor(0.0)
-        hidden_feature_used_hidden_abs_count = rewards.new_tensor(0.0)
         hidden_feature_used_alive_hidden_abs_sum = rewards.new_tensor(0.0)
         hidden_feature_used_alive_hidden_abs_count = rewards.new_tensor(0.0)
-        prior_state_mu_sum = rewards.new_tensor(0.0)
-        prior_state_mu_count = rewards.new_tensor(0.0)
-        prior_state_logvar_sum = rewards.new_tensor(0.0)
-        prior_state_logvar_count = rewards.new_tensor(0.0)
-        post_state_mu_sum = rewards.new_tensor(0.0)
-        post_state_mu_count = rewards.new_tensor(0.0)
-        post_state_logvar_sum = rewards.new_tensor(0.0)
-        post_state_logvar_count = rewards.new_tensor(0.0)
-        prior_z_mu_sum = rewards.new_tensor(0.0)
-        prior_z_mu_count = rewards.new_tensor(0.0)
-        prior_z_logvar_sum = rewards.new_tensor(0.0)
-        prior_z_logvar_count = rewards.new_tensor(0.0)
-        post_z_mu_sum = rewards.new_tensor(0.0)
-        post_z_mu_count = rewards.new_tensor(0.0)
-        post_z_logvar_sum = rewards.new_tensor(0.0)
-        post_z_logvar_count = rewards.new_tensor(0.0)
         prior_conf_sum = rewards.new_tensor(0.0)
         prior_conf_count = rewards.new_tensor(0.0)
 
@@ -197,15 +161,6 @@ class QLearnerTokenCVAEBelief:
             alive_mask_t = alive_mask_t.unsqueeze(1).expand(-1, self.args.n_agents, -1)
             time_mask_t = batch["filled"][:, t].float().unsqueeze(1).expand(-1, self.args.n_agents, -1)
             active_agent_mask_t = time_mask_t.squeeze(-1)
-            slot_visible_frac_t = enemy_visible_t.mean(dim=-1)
-            slot_hidden_frac_t = 1.0 - slot_visible_frac_t
-            slot_hidden_present_t = (slot_hidden_frac_t > 0).float()
-            belief_visible_frac_sum = belief_visible_frac_sum + (slot_visible_frac_t * active_agent_mask_t).sum()
-            belief_visible_frac_count = belief_visible_frac_count + active_agent_mask_t.sum()
-            belief_hidden_frac_sum = belief_hidden_frac_sum + (slot_hidden_frac_t * active_agent_mask_t).sum()
-            belief_hidden_frac_count = belief_hidden_frac_count + active_agent_mask_t.sum()
-            belief_hidden_present_sum = belief_hidden_present_sum + (slot_hidden_present_t * active_agent_mask_t).sum()
-            belief_hidden_present_count = belief_hidden_present_count + active_agent_mask_t.sum()
             alive_present_t = (alive_mask_t.sum(dim=-1) > 0).float()
             active_visible_mask_t = active_agent_mask_t * alive_present_t
             alive_total_t = alive_mask_t.sum(dim=-1).clamp(min=1.0)
@@ -231,32 +186,15 @@ class QLearnerTokenCVAEBelief:
             agent_outs = self.mac.forward(batch, t=t, hidden_enemy_state=hidden_enemy_state_t)
             mac_out.append(agent_outs)
 
-            hidden_feature_gate_t = self.mac.get_hidden_feature_gate().squeeze(-1).mean(dim=-1)
-            hidden_feature_used_t = self.mac.get_hidden_feature_used().abs().mean(dim=(-1, -2))
-            hidden_feature_gate_sum = hidden_feature_gate_sum + (hidden_feature_gate_t * active_agent_mask_t).sum()
-            hidden_feature_gate_count = hidden_feature_gate_count + active_agent_mask_t.sum()
-            hidden_feature_used_abs_sum = hidden_feature_used_abs_sum + (hidden_feature_used_t * active_agent_mask_t).sum()
-            hidden_feature_used_abs_count = hidden_feature_used_abs_count + active_agent_mask_t.sum()
-
             hidden_feature_gate_slots_t = self.mac.get_hidden_feature_gate().squeeze(-1)
             hidden_feature_used_slots_t = self.mac.get_hidden_feature_used().abs().mean(dim=-1)
             slot_hidden_mask_t = (1.0 - enemy_visible_t) * time_mask_t
             alive_hidden_mask_t = slot_hidden_mask_t * alive_mask_t
-            hidden_feature_gate_hidden_sum = hidden_feature_gate_hidden_sum + (
-                hidden_feature_gate_slots_t * slot_hidden_mask_t
-            ).sum()
-            hidden_feature_gate_hidden_count = hidden_feature_gate_hidden_count + slot_hidden_mask_t.sum()
             hidden_feature_gate_alive_hidden_sum = hidden_feature_gate_alive_hidden_sum + (
                 hidden_feature_gate_slots_t * alive_hidden_mask_t
             ).sum()
             hidden_feature_gate_alive_hidden_count = (
                 hidden_feature_gate_alive_hidden_count + alive_hidden_mask_t.sum()
-            )
-            hidden_feature_used_hidden_abs_sum = hidden_feature_used_hidden_abs_sum + (
-                hidden_feature_used_slots_t * slot_hidden_mask_t
-            ).sum()
-            hidden_feature_used_hidden_abs_count = (
-                hidden_feature_used_hidden_abs_count + slot_hidden_mask_t.sum()
             )
             hidden_feature_used_alive_hidden_abs_sum = hidden_feature_used_alive_hidden_abs_sum + (
                 hidden_feature_used_slots_t * alive_hidden_mask_t
@@ -272,28 +210,12 @@ class QLearnerTokenCVAEBelief:
             prior_z_mu_t, prior_z_logvar_t = self.mac.get_prior_latent_stats()
             prior_conf_t = self.mac.get_prior_belief_confidence()
 
-            prior_state_mu_sum = prior_state_mu_sum + prior_state_mu_t.mean()
-            prior_state_mu_count = prior_state_mu_count + prior_state_mu_t.new_tensor(1.0)
-            prior_state_logvar_sum = prior_state_logvar_sum + prior_state_logvar_t.mean()
-            prior_state_logvar_count = prior_state_logvar_count + prior_state_logvar_t.new_tensor(1.0)
-            prior_z_mu_sum = prior_z_mu_sum + prior_z_mu_t.mean()
-            prior_z_mu_count = prior_z_mu_count + prior_z_mu_t.new_tensor(1.0)
-            prior_z_logvar_sum = prior_z_logvar_sum + prior_z_logvar_t.mean()
-            prior_z_logvar_count = prior_z_logvar_count + prior_z_logvar_t.new_tensor(1.0)
             prior_conf_sum = prior_conf_sum + prior_conf_t.mean()
             prior_conf_count = prior_conf_count + prior_conf_t.new_tensor(1.0)
 
             if hidden_enemy_state_active:
                 posterior_state_mu_t, posterior_state_logvar_t = self.mac.get_posterior_belief_stats()
                 posterior_z_mu_t, posterior_z_logvar_t = self.mac.get_posterior_latent_stats()
-                post_state_mu_sum = post_state_mu_sum + posterior_state_mu_t.mean()
-                post_state_mu_count = post_state_mu_count + posterior_state_mu_t.new_tensor(1.0)
-                post_state_logvar_sum = post_state_logvar_sum + posterior_state_logvar_t.mean()
-                post_state_logvar_count = post_state_logvar_count + posterior_state_logvar_t.new_tensor(1.0)
-                post_z_mu_sum = post_z_mu_sum + posterior_z_mu_t.mean()
-                post_z_mu_count = post_z_mu_count + posterior_z_mu_t.new_tensor(1.0)
-                post_z_logvar_sum = post_z_logvar_sum + posterior_z_logvar_t.mean()
-                post_z_logvar_count = post_z_logvar_count + posterior_z_logvar_t.new_tensor(1.0)
 
                 enemy_obs_t = batch["obs"][:, t, :, enemy_obs_start:enemy_obs_end]
                 enemy_obs_t = enemy_obs_t.view(
@@ -308,13 +230,13 @@ class QLearnerTokenCVAEBelief:
                 hidden_mask_t = (1.0 - enemy_visible_t) * alive_mask_t * time_mask_t
                 hidden_present_t = (hidden_mask_t.sum(dim=-1) > 0).float()
 
-                posterior_raw_nll_t, posterior_nll_t = self._stabilized_gaussian_nll(hidden_enemy_state_t.view(
+                _, posterior_nll_t = self._stabilized_gaussian_nll(hidden_enemy_state_t.view(
                     batch.batch_size,
                     self.args.n_agents,
                     self.args.enemy_num,
                     self.enemy_state_feat_dim,
                 ), posterior_state_mu_t, posterior_state_logvar_t)
-                prior_raw_nll_t, prior_nll_t = self._stabilized_gaussian_nll(hidden_enemy_state_t.view(
+                _, prior_nll_t = self._stabilized_gaussian_nll(hidden_enemy_state_t.view(
                     batch.batch_size,
                     self.args.n_agents,
                     self.args.enemy_num,
@@ -324,12 +246,6 @@ class QLearnerTokenCVAEBelief:
                 belief_post_denom = belief_post_denom + hidden_mask_t.sum()
                 belief_prior_sum = belief_prior_sum + (prior_nll_t * hidden_mask_t).sum()
                 belief_prior_denom = belief_prior_denom + hidden_mask_t.sum()
-                belief_prior_nll_sum = belief_prior_nll_sum + (prior_nll_t * hidden_mask_t).sum()
-                belief_prior_nll_denom = belief_prior_nll_denom + hidden_mask_t.sum()
-                belief_prior_raw_sum = belief_prior_raw_sum + (prior_raw_nll_t * hidden_mask_t).sum()
-                belief_prior_raw_count = belief_prior_raw_count + hidden_mask_t.sum()
-                belief_post_raw_sum = belief_post_raw_sum + (posterior_raw_nll_t * hidden_mask_t).sum()
-                belief_post_raw_count = belief_post_raw_count + hidden_mask_t.sum()
 
                 kl_t = self._kl_divergence(posterior_z_mu_t, posterior_z_logvar_t, prior_z_mu_t, prior_z_logvar_t)
                 belief_kl_sum = belief_kl_sum + (kl_t * hidden_present_t).sum()
@@ -413,10 +329,6 @@ class QLearnerTokenCVAEBelief:
         belief_prior_loss = belief_prior_sum / belief_prior_denom.clamp(min=1.0)
         belief_post_loss = belief_post_sum / belief_post_denom.clamp(min=1.0)
         belief_kl_loss = belief_kl_sum / belief_kl_denom.clamp(min=1.0)
-        belief_prior_raw_nll = belief_prior_raw_sum / belief_prior_raw_count.clamp(min=1.0)
-        belief_post_raw_nll = belief_post_raw_sum / belief_post_raw_count.clamp(min=1.0)
-        belief_prior_nll = belief_prior_raw_nll
-        belief_post_nll = belief_post_raw_nll
         belief_loss = belief_prior_loss + self.belief_posterior_coef * belief_post_loss + belief_kl_weight * belief_kl_loss
         belief_weighted_loss = belief_weight * belief_loss
         belief_effective_post_weight = belief_weight * self.belief_posterior_coef
@@ -440,28 +352,11 @@ class QLearnerTokenCVAEBelief:
             self.logger.log_stat("belief_weighted_q_ratio", abs(belief_weighted_loss.item()) / (q_loss.item() + 1e-6) if q_learning_active else 0.0, t_env)
             self.logger.log_stat("belief_prior_loss", belief_prior_loss.item(), t_env)
             self.logger.log_stat("belief_post_loss", belief_post_loss.item(), t_env)
-            self.logger.log_stat("belief_prior_stable_nll", belief_prior_loss.item(), t_env)
-            self.logger.log_stat("belief_post_stable_nll", belief_post_loss.item(), t_env)
-            self.logger.log_stat("belief_prior_nll", belief_prior_nll.item(), t_env)
-            self.logger.log_stat("belief_post_nll", belief_post_nll.item(), t_env)
             self.logger.log_stat("belief_kl_loss", belief_kl_loss.item(), t_env)
             self.logger.log_stat("belief_weight", belief_weight, t_env)
             self.logger.log_stat("belief_effective_post_weight", belief_effective_post_weight, t_env)
             self.logger.log_stat("belief_effective_kl_weight", belief_effective_kl_weight, t_env)
-            self.logger.log_stat("belief_kl_weight", belief_kl_weight, t_env)
-            self.logger.log_stat("belief_kl_coef", self.belief_kl_coef, t_env)
-            self.logger.log_stat("belief_pretraining_active", float(belief_pretraining_active), t_env)
-            self.logger.log_stat("belief_pretrain_only", float(self.belief_pretrain_only), t_env)
-            self.logger.log_stat("belief_prior_raw_nll", belief_prior_raw_nll.item(), t_env)
-            self.logger.log_stat("belief_post_raw_nll", belief_post_raw_nll.item(), t_env)
-            self.logger.log_stat("belief_prior_state_mu_mean", prior_state_mu_sum.item() / prior_state_mu_count.clamp(min=1.0).item(), t_env)
-            self.logger.log_stat("belief_prior_state_logvar_mean", prior_state_logvar_sum.item() / prior_state_logvar_count.clamp(min=1.0).item(), t_env)
-            self.logger.log_stat("belief_prior_z_mu_mean", prior_z_mu_sum.item() / prior_z_mu_count.clamp(min=1.0).item(), t_env)
-            self.logger.log_stat("belief_prior_z_logvar_mean", prior_z_logvar_sum.item() / prior_z_logvar_count.clamp(min=1.0).item(), t_env)
             self.logger.log_stat("belief_prior_confidence_mean", prior_conf_sum.item() / prior_conf_count.clamp(min=1.0).item(), t_env)
-            self.logger.log_stat("belief_visible_frac_mean", belief_visible_frac_sum.item() / belief_visible_frac_count.clamp(min=1.0).item(), t_env)
-            self.logger.log_stat("belief_hidden_frac_mean", belief_hidden_frac_sum.item() / belief_hidden_frac_count.clamp(min=1.0).item(), t_env)
-            self.logger.log_stat("belief_hidden_present_rate", belief_hidden_present_sum.item() / belief_hidden_present_count.clamp(min=1.0).item(), t_env)
             self.logger.log_stat(
                 "belief_alive_visible_frac_mean",
                 belief_alive_visible_frac_sum.item() / belief_alive_visible_frac_count.clamp(min=1.0).item(),
@@ -478,28 +373,8 @@ class QLearnerTokenCVAEBelief:
                 t_env,
             )
             self.logger.log_stat(
-                "hidden_feature_gate_mean",
-                hidden_feature_gate_sum.item() / hidden_feature_gate_count.clamp(min=1.0).item(),
-                t_env,
-            )
-            self.logger.log_stat(
-                "hidden_feature_gate_hidden_mean",
-                hidden_feature_gate_hidden_sum.item() / hidden_feature_gate_hidden_count.clamp(min=1.0).item(),
-                t_env,
-            )
-            self.logger.log_stat(
                 "hidden_feature_gate_alive_hidden_mean",
                 hidden_feature_gate_alive_hidden_sum.item() / hidden_feature_gate_alive_hidden_count.clamp(min=1.0).item(),
-                t_env,
-            )
-            self.logger.log_stat(
-                "hidden_feature_used_abs_mean",
-                hidden_feature_used_abs_sum.item() / hidden_feature_used_abs_count.clamp(min=1.0).item(),
-                t_env,
-            )
-            self.logger.log_stat(
-                "hidden_feature_used_hidden_abs_mean",
-                hidden_feature_used_hidden_abs_sum.item() / hidden_feature_used_hidden_abs_count.clamp(min=1.0).item(),
                 t_env,
             )
             self.logger.log_stat(
@@ -507,11 +382,6 @@ class QLearnerTokenCVAEBelief:
                 hidden_feature_used_alive_hidden_abs_sum.item() / hidden_feature_used_alive_hidden_abs_count.clamp(min=1.0).item(),
                 t_env,
             )
-            if hidden_enemy_state_active:
-                self.logger.log_stat("belief_post_state_mu_mean", post_state_mu_sum.item() / post_state_mu_count.clamp(min=1.0).item(), t_env)
-                self.logger.log_stat("belief_post_state_logvar_mean", post_state_logvar_sum.item() / post_state_logvar_count.clamp(min=1.0).item(), t_env)
-                self.logger.log_stat("belief_post_z_mu_mean", post_z_mu_sum.item() / post_z_mu_count.clamp(min=1.0).item(), t_env)
-                self.logger.log_stat("belief_post_z_logvar_mean", post_z_logvar_sum.item() / post_z_logvar_count.clamp(min=1.0).item(), t_env)
             self.logger.log_stat("grad_norm", grad_norm, t_env)
             if q_learning_active:
                 mask_elems = q_mask.sum().item()
