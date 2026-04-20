@@ -121,6 +121,13 @@ class QLearnerTokenValueCVAEBelief:
             prior_logvar - post_logvar + (th.exp(post_logvar) + diff.pow(2)) * th.exp(-prior_logvar) - 1.0
         ).sum(dim=-1)
 
+    def _masked_mean(self, feats, mask):
+        if feats.size(1) == 0:
+            return feats.new_zeros(feats.size(0), feats.size(-1))
+        mask = mask.unsqueeze(-1).float()
+        denom = mask.sum(dim=1).clamp(min=1.0)
+        return (feats * mask).sum(dim=1) / denom
+
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int):
         rewards = batch["reward"][:, :-1]
         actions = batch["actions"][:, :-1]
