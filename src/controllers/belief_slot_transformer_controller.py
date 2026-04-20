@@ -157,7 +157,8 @@ class BeliefSlotTransformerMAC:
         padded_belief = th.zeros(bs, self.n_agents, self.args.state_shape, device=ep_batch.device)
         flat_enemy_belief = self.belief_mu.reshape(bs, self.n_agents, -1)
         padded_belief[:, :, self.ally_state_feat_dim:self.ally_state_feat_dim + self.enemy_state_dim] = flat_enemy_belief
-        ep_batch["belief"][:, t] = padded_belief
+        if "belief" in ep_batch.data.transition_data:
+            ep_batch["belief"][:, t] = padded_belief
 
         return agent_outs.view(bs, self.n_agents, -1)
 
