@@ -161,9 +161,7 @@ class TokenValueCVAEBeliefAgent(nn.Module):
         enemy_start = 3
         enemy_end = enemy_start + self.n_enemies
         current_memory = encoded[:, 0, :]
-        enemy_ctx = encoded[:, enemy_start:enemy_end, :]
-        ally_ctx = encoded[:, enemy_end:, :]
-        return current_memory, move_feat, self_feat, enemy_feat, ally_feat, enemy_ctx, ally_ctx
+        return current_memory, move_feat, self_feat, enemy_feat, ally_feat
 
     def _history_context(self, current_memory, prev_action_feat):
         return self.history_context(th.cat([current_memory, prev_action_feat], dim=-1))
@@ -199,8 +197,6 @@ class TokenValueCVAEBeliefAgent(nn.Module):
             self_feat,
             enemy_feat,
             ally_feat,
-            enemy_ctx,
-            ally_ctx,
         ) = self._encode_current_step(current_step, prev_memory)
 
         ally_summary = self._masked_mean(ally_feat, current_step["ally_visible"])
@@ -220,7 +216,8 @@ class TokenValueCVAEBeliefAgent(nn.Module):
             prior_belief_conf = prior_belief_mu.new_ones(prior_belief_mu.size(0), self.n_enemies, 1)
         else:
             prior_belief_conf = self._belief_confidence(prior_belief_logvar)
-        prior_belief_feat = F.relu(self.belief_enemy_proj(prior_belief_mu)) * prior_belief_conf
+        prior_belief_feat_raw = F.relu(self.belief_enemy_proj(prior_belief_mu))
+        prior_belief_feat = prior_belief_feat_raw * prior_belief_conf
 
         visible_enemy_feat = current_step["enemy_visible"].unsqueeze(-1).float() * real_enemy_feat
         if self.use_belief_for_q:
@@ -230,15 +227,12 @@ class TokenValueCVAEBeliefAgent(nn.Module):
         else:
             fused_enemy_feat = visible_enemy_feat
 
-        enemy_mask = th.ones_like(current_step["enemy_visible"])
-        visible_enemy_summary = self._masked_mean(visible_enemy_feat, enemy_mask)
-        enemy_summary = self._masked_mean(fused_enemy_feat, enemy_mask)
-        enemy_attn = enemy_mask / enemy_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
-        q_visible = self.q_head(th.cat([q_context, visible_enemy_summary], dim=-1))
+        enemy_summary = fused_enemy_feat.mean(dim=1)
         q = self.q_head(th.cat([q_context, enemy_summary], dim=-1))
 
-        q_context_expand = q_context.unsqueeze(1).expand(-1, self.n_enemies, -1)
-        aux_belief_value = self.belief_value_head(th.cat([prior_belief_feat, q_context_expand], dim=-1))
+        # Keep auxiliary value supervision from directly reshaping the online q_context.
+        q_context_expand = q_context.detach().unsqueeze(1).expand(-1, self.n_enemies, -1)
+        aux_belief_value = self.belief_value_head(th.cat([prior_belief_feat_raw, q_context_expand], dim=-1))
 
         posterior_belief_mu = None
         posterior_belief_logvar = None
@@ -261,12 +255,8 @@ class TokenValueCVAEBeliefAgent(nn.Module):
             posterior_z_mu,
             posterior_z_logvar,
             q_context,
-            enemy_summary,
-            fused_enemy_feat,
-            enemy_attn,
             prior_belief_conf,
             real_enemy_feat,
-            prior_belief_feat,
+            prior_belief_feat_raw,
             aux_belief_value,
-            q_visible,
         )
