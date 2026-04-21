@@ -42,8 +42,6 @@ belief_pretrain_only: False
 disable_belief: False
 use_belief_for_q: True
 
-belief_teacher_state_coef: 0.1
-belief_teacher_delta_q_coef: 0.1
 belief_repr_coef: 0.05
 belief_aux_delta_q_coef: 0.1
 belief_distill_importance_min: 0.25

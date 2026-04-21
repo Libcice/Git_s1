@@ -20,7 +20,6 @@ class QLearnerTokenValueCVAEBelief:
 
         self.mac_params = list(mac.parameters())
         self.online_params = list(self.mac_params)
-        self.teacher_params = []
         self.last_target_update_episode = 0
 
         self.mixer = None
@@ -60,10 +59,6 @@ class QLearnerTokenValueCVAEBelief:
         self.belief_pretrain_t = getattr(self.args, "belief_pretrain_t", 50000)
         self.belief_pretrain_only = getattr(self.args, "belief_pretrain_only", False)
 
-        # Teacher TD on the shared mixer/q path was destabilizing training.
-        # Keep teacher supervision off the shared online QMIX path.
-        self.belief_teacher_state_coef = getattr(self.args, "belief_teacher_state_coef", 0.1)
-        self.belief_teacher_delta_q_coef = getattr(self.args, "belief_teacher_delta_q_coef", 0.1)
         self.belief_repr_coef = getattr(self.args, "belief_repr_coef", 0.05)
         self.belief_aux_delta_q_coef = getattr(self.args, "belief_aux_delta_q_coef", 0.1)
         self.belief_distill_importance_min = getattr(self.args, "belief_distill_importance_min", 0.25)
@@ -76,61 +71,16 @@ class QLearnerTokenValueCVAEBelief:
         if self.disable_belief:
             self.belief_loss_coef = 0.0
             self.belief_kl_coef = 0.0
-            self.belief_teacher_state_coef = 0.0
-            self.belief_teacher_delta_q_coef = 0.0
             self.belief_repr_coef = 0.0
             self.belief_aux_delta_q_coef = 0.0
             self.belief_pretrain_only = False
 
         self.posterior_enabled = self.belief_loss_coef > 0.0
-        self.value_losses_enabled = (
-            self.belief_teacher_state_coef > 0.0
-            or self.belief_teacher_delta_q_coef > 0.0
-            or self.belief_repr_coef > 0.0
-            or self.belief_aux_delta_q_coef > 0.0
-        )
+        self.value_losses_enabled = self.belief_repr_coef > 0.0 or self.belief_aux_delta_q_coef > 0.0
         self.belief_enabled = self.posterior_enabled or self.use_belief_for_q or self.value_losses_enabled
         self.q_learning_started = False
 
-        teacher_enemy_input_dim = self.enemy_state_feat_dim + self.ally_state_feat_dim * 2 + 1
-        self.teacher_enemy_encoder = th.nn.Sequential(
-            th.nn.Linear(teacher_enemy_input_dim, self.hidden_dim),
-            th.nn.ReLU(),
-            th.nn.Linear(self.hidden_dim, self.hidden_dim),
-        )
-        self.teacher_enemy_decoder = th.nn.Sequential(
-            th.nn.Linear(self.hidden_dim, self.hidden_dim),
-            th.nn.ReLU(),
-            th.nn.Linear(self.hidden_dim, self.enemy_state_feat_dim),
-        )
-        teacher_query_input_dim = self.ally_state_feat_dim * 2 + self.enemy_state_feat_dim + 2
-        self.teacher_query_encoder = th.nn.Sequential(
-            th.nn.Linear(teacher_query_input_dim, self.hidden_dim * 2),
-            th.nn.ReLU(),
-            th.nn.Linear(self.hidden_dim * 2, self.hidden_dim),
-        )
-        self.teacher_delta_q_head = th.nn.Sequential(
-            th.nn.Linear(self.hidden_dim * 2, self.hidden_dim * 2),
-            th.nn.ReLU(),
-            th.nn.Linear(self.hidden_dim * 2, self.args.n_actions),
-        )
-        self.teacher_params += list(self.teacher_enemy_encoder.parameters())
-        self.teacher_params += list(self.teacher_enemy_decoder.parameters())
-        self.teacher_params += list(self.teacher_query_encoder.parameters())
-        self.teacher_params += list(self.teacher_delta_q_head.parameters())
-
-        teacher_lr = getattr(args, "teacher_lr", args.lr)
-        teacher_optim_alpha = getattr(args, "teacher_optim_alpha", args.optim_alpha)
-        teacher_optim_eps = getattr(args, "teacher_optim_eps", args.optim_eps)
-        self.teacher_grad_norm_clip = getattr(args, "teacher_grad_norm_clip", args.grad_norm_clip)
-
         self.optimiser = RMSprop(params=self.online_params, lr=args.lr, alpha=args.optim_alpha, eps=args.optim_eps)
-        self.teacher_optimiser = RMSprop(
-            params=self.teacher_params,
-            lr=teacher_lr,
-            alpha=teacher_optim_alpha,
-            eps=teacher_optim_eps,
-        )
         self.target_mac = copy.deepcopy(mac)
         self.log_stats_t = -self.args.learner_log_interval - 1
 
@@ -169,22 +119,7 @@ class QLearnerTokenValueCVAEBelief:
         denom = mask.sum(dim=1).clamp(min=1.0)
         return (feats * mask).sum(dim=1) / denom
 
-    def _build_teacher_query(self, own_state_t, ally_mean_agent_t, hidden_enemy_view, enemy_visible_t, hidden_mask_t):
-        visible_enemy_mean_t = self._masked_mean(
-            hidden_enemy_view.reshape(
-                hidden_enemy_view.size(0) * hidden_enemy_view.size(1),
-                self.args.enemy_num,
-                self.enemy_state_feat_dim,
-            ),
-            enemy_visible_t.reshape(hidden_enemy_view.size(0) * hidden_enemy_view.size(1), self.args.enemy_num),
-        ).reshape(hidden_enemy_view.size(0), hidden_enemy_view.size(1), self.enemy_state_feat_dim)
-        visible_frac_t = enemy_visible_t.mean(dim=-1, keepdim=True)
-        hidden_frac_t = hidden_mask_t.mean(dim=-1, keepdim=True)
-        return self.teacher_query_encoder(
-            th.cat([own_state_t, ally_mean_agent_t, visible_enemy_mean_t, visible_frac_t, hidden_frac_t], dim=-1)
-        )
-
-    def _build_oracle_delta_q(self, q_context_t, real_enemy_feat_t, hidden_enemy_view, enemy_visible_t):
+    def _build_oracle_targets(self, q_context_t, real_enemy_feat_t, hidden_enemy_view, enemy_visible_t):
         bs, n_agents, n_enemies, _ = hidden_enemy_view.shape
         target_agent = self.target_mac.agent
         with th.no_grad():
@@ -195,27 +130,28 @@ class QLearnerTokenValueCVAEBelief:
                     hidden_enemy_view.reshape(bs * n_agents * n_enemies, self.enemy_state_feat_dim)
                 )
             ).view(bs, n_agents, n_enemies, self.hidden_dim)
-            visible_enemy_sum_t = visible_enemy_feat_t.sum(dim=2, keepdim=True)
-            oracle_slot_summary_t = (visible_enemy_sum_t + oracle_hidden_feat_t) / float(max(1, self.args.enemy_num))
             q_context_detached_t = q_context_t.detach()
-            q_context_expand_t = q_context_t.detach().unsqueeze(2).expand(-1, -1, n_enemies, -1)
-            oracle_slot_q_t = target_agent.q_head(
-                th.cat([q_context_expand_t, oracle_slot_summary_t], dim=-1).reshape(
-                    bs * n_agents * n_enemies,
-                    self.hidden_dim * 2,
-                )
-            ).view(bs, n_agents, n_enemies, self.args.n_actions)
-            lagged_visible_q_t = target_agent.q_head(
+            oracle_hidden_summary_t = (
+                ((1.0 - enemy_visible_t).unsqueeze(-1).float() * oracle_hidden_feat_t).sum(dim=2)
+                / float(max(1, n_enemies))
+            )
+            q_visible_t = target_agent.q_head(
                 th.cat([q_context_detached_t, visible_enemy_summary_t], dim=-1).reshape(bs * n_agents, self.hidden_dim * 2)
             ).view(bs, n_agents, self.args.n_actions)
-            oracle_delta_q_t = oracle_slot_q_t - lagged_visible_q_t.unsqueeze(2)
-        return oracle_delta_q_t
+            q_oracle_t = target_agent.q_head(
+                th.cat([q_context_detached_t, visible_enemy_summary_t + oracle_hidden_summary_t], dim=-1).reshape(
+                    bs * n_agents,
+                    self.hidden_dim * 2,
+                )
+            ).view(bs, n_agents, self.args.n_actions)
+            delta_q_target_t = q_oracle_t - q_visible_t
+        return oracle_hidden_feat_t, delta_q_target_t
 
-    def _build_distill_importance(self, oracle_delta_q_t, distill_mask_t):
+    def _build_distill_importance(self, delta_q_target_t, distill_mask_t):
         with th.no_grad():
-            raw_importance_t = oracle_delta_q_t.abs().mean(dim=-1)
-            slot_count_t = distill_mask_t.sum(dim=-1, keepdim=True)
-            mean_importance_t = (raw_importance_t * distill_mask_t).sum(dim=-1, keepdim=True) / slot_count_t.clamp(min=1.0)
+            raw_importance_t = delta_q_target_t.abs().mean(dim=-1)
+            agent_count_t = distill_mask_t.sum(dim=-1, keepdim=True)
+            mean_importance_t = (raw_importance_t * distill_mask_t).sum(dim=-1, keepdim=True) / agent_count_t.clamp(min=1.0)
             normalized_importance_t = raw_importance_t / mean_importance_t.clamp(min=1e-6)
             normalized_importance_t = normalized_importance_t.clamp(
                 min=self.belief_distill_importance_min,
@@ -223,7 +159,7 @@ class QLearnerTokenValueCVAEBelief:
             )
             normalized_importance_t = normalized_importance_t * distill_mask_t
             normalized_importance_t = th.where(
-                slot_count_t > 0,
+                agent_count_t > 0,
                 normalized_importance_t,
                 th.zeros_like(normalized_importance_t),
             )
@@ -304,10 +240,6 @@ class QLearnerTokenValueCVAEBelief:
         post_z_logvar_count = rewards.new_tensor(0.0)
         prior_conf_sum = rewards.new_tensor(0.0)
         prior_conf_count = rewards.new_tensor(0.0)
-        teacher_state_loss_sum = rewards.new_tensor(0.0)
-        teacher_state_loss_denom = rewards.new_tensor(0.0)
-        teacher_delta_q_loss_sum = rewards.new_tensor(0.0)
-        teacher_delta_q_loss_denom = rewards.new_tensor(0.0)
         repr_loss_sum = rewards.new_tensor(0.0)
         repr_loss_denom = rewards.new_tensor(0.0)
         aux_delta_q_loss_sum = rewards.new_tensor(0.0)
@@ -320,8 +252,6 @@ class QLearnerTokenValueCVAEBelief:
         prior_raw_nll_denom = rewards.new_tensor(0.0)
         post_raw_nll_sum = rewards.new_tensor(0.0)
         post_raw_nll_denom = rewards.new_tensor(0.0)
-        teacher_state_weight = 0.0
-        teacher_delta_q_weight = 0.0
         repr_weight = 0.0
         aux_delta_q_weight = 0.0
         value_warm = min(1.0, float(t_env) / float(max(1, self.belief_value_warmup_t)))
@@ -470,78 +400,40 @@ class QLearnerTokenValueCVAEBelief:
                 belief_kl_denom = belief_kl_denom + hidden_present_t.sum()
 
             if mac_value_active and hidden_enemy_view is not None and t < batch.max_seq_length - 1:
-                valid_step_mask_t = mask[:, t].reshape(batch.batch_size, -1)[:, 0]
+                valid_step_mask_t = mask[:, t, 0]
                 valid_agent_mask_t = valid_step_mask_t.unsqueeze(1).expand(-1, self.args.n_agents)
-                ally_state_t = batch["state"][:, t, :self.ally_state_dim]
-                ally_state_t = ally_state_t.reshape(batch.batch_size, self.args.n_agents, self.ally_state_feat_dim)
-                own_state_t = ally_state_t
-                ally_mean_agent_t = ally_state_t.mean(dim=1, keepdim=True).expand(-1, self.args.n_agents, -1)
-                teacher_query_t = self._build_teacher_query(
-                    own_state_t,
-                    ally_mean_agent_t,
-                    hidden_enemy_view,
-                    enemy_visible_t,
-                    hidden_mask_t,
-                )
-                teacher_query_expand_t = teacher_query_t.unsqueeze(2).expand(-1, -1, self.args.enemy_num, -1)
-                own_state_expand_t = own_state_t.unsqueeze(2).expand(-1, -1, self.args.enemy_num, -1)
-                ally_mean_expand_t = ally_mean_agent_t.unsqueeze(2).expand(-1, -1, self.args.enemy_num, -1)
-                teacher_enemy_input_t = th.cat(
-                    [hidden_enemy_view, own_state_expand_t, ally_mean_expand_t, enemy_visible_t.unsqueeze(-1)],
-                    dim=-1,
-                )
-                teacher_enemy_repr_t = self.teacher_enemy_encoder(teacher_enemy_input_t)
-                teacher_enemy_state_pred_t = self.teacher_enemy_decoder(teacher_enemy_repr_t)
                 q_context_t = target_q_context_cache[t]
                 real_enemy_feat_t = target_real_enemy_feat_cache[t]
-                oracle_delta_q_t = self._build_oracle_delta_q(
+                oracle_hidden_feat_t, delta_q_target_t = self._build_oracle_targets(
                     q_context_t,
                     real_enemy_feat_t,
                     hidden_enemy_view,
                     enemy_visible_t,
                 )
-                teacher_delta_q_t = self.teacher_delta_q_head(
-                    th.cat([teacher_query_expand_t, teacher_enemy_repr_t], dim=-1)
-                )
-                teacher_mask_t = hidden_mask_t * valid_agent_mask_t.unsqueeze(-1)
-                distill_importance_t = self._build_distill_importance(oracle_delta_q_t, teacher_mask_t)
-                oracle_delta_abs_t = oracle_delta_q_t.abs().mean(dim=-1)
-
-                teacher_state_error_t = F.smooth_l1_loss(
-                    teacher_enemy_state_pred_t,
-                    hidden_enemy_view,
-                    reduction="none",
-                ).mean(dim=-1)
-                teacher_state_loss_sum = teacher_state_loss_sum + (teacher_state_error_t * teacher_mask_t).sum()
-                teacher_state_loss_denom = teacher_state_loss_denom + teacher_mask_t.sum()
-
-                teacher_delta_error_t = F.smooth_l1_loss(
-                    teacher_delta_q_t,
-                    oracle_delta_q_t.detach(),
-                    reduction="none",
-                ).mean(dim=-1)
-                teacher_delta_q_loss_sum = teacher_delta_q_loss_sum + (teacher_delta_error_t * teacher_mask_t).sum()
-                teacher_delta_q_loss_denom = teacher_delta_q_loss_denom + teacher_mask_t.sum()
+                distill_agent_mask_t = hidden_present_t * valid_agent_mask_t
+                distill_importance_t = self._build_distill_importance(delta_q_target_t, distill_agent_mask_t)
+                oracle_delta_abs_t = delta_q_target_t.abs().mean(dim=-1)
 
                 repr_error_t = F.smooth_l1_loss(
                     prior_belief_feat_t,
-                    teacher_enemy_repr_t.detach(),
+                    oracle_hidden_feat_t.detach(),
                     reduction="none",
                 ).mean(dim=-1)
-                repr_loss_sum = repr_loss_sum + (repr_error_t * distill_importance_t).sum()
-                repr_loss_denom = repr_loss_denom + distill_importance_t.sum()
+                repr_slot_weight_t = hidden_mask_t * distill_importance_t.unsqueeze(-1)
+                repr_loss_sum = repr_loss_sum + (repr_error_t * repr_slot_weight_t).sum()
+                repr_loss_denom = repr_loss_denom + repr_slot_weight_t.sum()
 
                 aux_error_t = F.smooth_l1_loss(
                     aux_belief_values_t,
-                    teacher_delta_q_t.detach(),
+                    delta_q_target_t.detach(),
                     reduction="none",
                 ).mean(dim=-1)
                 aux_delta_q_loss_sum = aux_delta_q_loss_sum + (aux_error_t * distill_importance_t).sum()
                 aux_delta_q_loss_denom = aux_delta_q_loss_denom + distill_importance_t.sum()
                 distill_importance_sum = distill_importance_sum + distill_importance_t.sum()
-                distill_importance_count = distill_importance_count + teacher_mask_t.sum()
-                oracle_delta_abs_sum = oracle_delta_abs_sum + (oracle_delta_abs_t * teacher_mask_t).sum()
-                oracle_delta_abs_denom = oracle_delta_abs_denom + teacher_mask_t.sum()
+                distill_importance_count = distill_importance_count + distill_agent_mask_t.sum()
+                oracle_delta_abs_sum = oracle_delta_abs_sum + (oracle_delta_abs_t * distill_agent_mask_t).sum()
+                oracle_delta_abs_denom = oracle_delta_abs_denom + distill_agent_mask_t.sum()
 
         mac_out = th.stack(mac_out, dim=1)
 
@@ -599,15 +491,11 @@ class QLearnerTokenValueCVAEBelief:
         belief_post_raw_nll = post_raw_nll_sum / post_raw_nll_denom.clamp(min=1.0)
         belief_prior_raw_nll = prior_raw_nll_sum / prior_raw_nll_denom.clamp(min=1.0)
         belief_kl_loss = belief_kl_sum / belief_kl_denom.clamp(min=1.0)
-        teacher_state_loss = teacher_state_loss_sum / teacher_state_loss_denom.clamp(min=1.0)
-        teacher_delta_q_loss = teacher_delta_q_loss_sum / teacher_delta_q_loss_denom.clamp(min=1.0)
         repr_loss = repr_loss_sum / repr_loss_denom.clamp(min=1.0)
         aux_delta_q_loss = aux_delta_q_loss_sum / aux_delta_q_loss_denom.clamp(min=1.0)
         distill_importance_mean = distill_importance_sum / distill_importance_count.clamp(min=1.0)
         oracle_delta_abs_mean = oracle_delta_abs_sum / oracle_delta_abs_denom.clamp(min=1.0)
 
-        teacher_state_weight = self.belief_teacher_state_coef * value_warm if mac_value_active else 0.0
-        teacher_delta_q_weight = self.belief_teacher_delta_q_coef * value_warm if mac_value_active else 0.0
         repr_weight = self.belief_repr_coef * value_warm if mac_value_active else 0.0
         aux_delta_q_weight = self.belief_aux_delta_q_coef * value_warm if mac_value_active else 0.0
         kl_progress = min(1.0, float(max(1, t_env)) / float(max(1, self.belief_kl_warmup_t)))
@@ -629,37 +517,26 @@ class QLearnerTokenValueCVAEBelief:
         belief_effective_post_weight = belief_weight * self.belief_posterior_coef
         belief_effective_kl_weight = belief_weight * belief_kl_weight
         main_loss = q_loss + belief_weighted_loss + repr_weight * repr_loss + aux_delta_q_weight * aux_delta_q_loss
-        teacher_loss = teacher_state_weight * teacher_state_loss + teacher_delta_q_weight * teacher_delta_q_loss
 
         if (
             not q_learning_active
             and belief_weight == 0.0
-            and teacher_state_weight == 0.0
-            and teacher_delta_q_weight == 0.0
             and repr_weight == 0.0
             and aux_delta_q_weight == 0.0
         ):
             return
 
         self.optimiser.zero_grad()
-        self.teacher_optimiser.zero_grad()
 
         grad_norm = rewards.new_tensor(0.0)
-        teacher_grad_norm = rewards.new_tensor(0.0)
-        teacher_update_active = teacher_state_weight > 0.0 or teacher_delta_q_weight > 0.0
         main_update_active = q_learning_active or belief_weight > 0.0 or repr_weight > 0.0 or aux_delta_q_weight > 0.0
-
-        if teacher_update_active:
-            teacher_loss.backward()
-            teacher_grad_norm = th.nn.utils.clip_grad_norm_(self.teacher_params, self.teacher_grad_norm_clip)
-            self.teacher_optimiser.step()
 
         if main_update_active:
             main_loss.backward()
             grad_norm = th.nn.utils.clip_grad_norm_(self.online_params, self.args.grad_norm_clip)
             self.optimiser.step()
 
-        loss = main_loss + teacher_loss
+        loss = main_loss
 
         if q_learning_active and (episode_num - self.last_target_update_episode) / self.args.target_update_interval >= 1.0:
             self._update_targets()
@@ -668,7 +545,6 @@ class QLearnerTokenValueCVAEBelief:
         if t_env - self.log_stats_t >= self.args.learner_log_interval:
             self.logger.log_stat("loss", loss.item(), t_env)
             self.logger.log_stat("main_loss", main_loss.item(), t_env)
-            self.logger.log_stat("teacher_loss", teacher_loss.item(), t_env)
             self.logger.log_stat("q_loss", q_loss.item(), t_env)
             self.logger.log_stat("belief_loss", belief_loss.item(), t_env)
             self.logger.log_stat("belief_weighted_loss", belief_weighted_loss.item(), t_env)
@@ -688,10 +564,6 @@ class QLearnerTokenValueCVAEBelief:
             self.logger.log_stat("belief_weight", belief_weight, t_env)
             self.logger.log_stat("belief_effective_post_weight", belief_effective_post_weight, t_env)
             self.logger.log_stat("belief_effective_kl_weight", belief_effective_kl_weight, t_env)
-            self.logger.log_stat("belief_teacher_state_loss", teacher_state_loss.item(), t_env)
-            self.logger.log_stat("belief_teacher_state_weight", teacher_state_weight, t_env)
-            self.logger.log_stat("belief_teacher_delta_q_loss", teacher_delta_q_loss.item(), t_env)
-            self.logger.log_stat("belief_teacher_delta_q_weight", teacher_delta_q_weight, t_env)
             self.logger.log_stat("belief_repr_loss", repr_loss.item(), t_env)
             self.logger.log_stat("belief_repr_weight", repr_weight, t_env)
             self.logger.log_stat("belief_aux_delta_q_loss", aux_delta_q_loss.item(), t_env)
@@ -711,7 +583,6 @@ class QLearnerTokenValueCVAEBelief:
                 self.logger.log_stat("belief_post_z_mu_mean", post_z_mu_sum.item() / post_z_mu_count.clamp(min=1.0).item(), t_env)
                 self.logger.log_stat("belief_post_z_logvar_mean", post_z_logvar_sum.item() / post_z_logvar_count.clamp(min=1.0).item(), t_env)
             self.logger.log_stat("grad_norm", grad_norm, t_env)
-            self.logger.log_stat("teacher_grad_norm", teacher_grad_norm, t_env)
             if q_learning_active:
                 mask_elems = q_mask.sum().item()
                 self.logger.log_stat("td_error_abs", masked_td_error.abs().sum().item() / mask_elems, t_env)
@@ -736,10 +607,6 @@ class QLearnerTokenValueCVAEBelief:
     def cuda(self):
         self.mac.cuda()
         self.target_mac.cuda()
-        self.teacher_enemy_encoder.cuda()
-        self.teacher_enemy_decoder.cuda()
-        self.teacher_query_encoder.cuda()
-        self.teacher_delta_q_head.cuda()
         if self.mixer is not None:
             self.mixer.cuda()
             self.target_mixer.cuda()
@@ -748,38 +615,13 @@ class QLearnerTokenValueCVAEBelief:
         self.mac.save_models(path)
         if self.mixer is not None:
             th.save(self.mixer.state_dict(), "{}/mixer.th".format(path))
-        th.save(self.teacher_enemy_encoder.state_dict(), "{}/teacher_enemy_encoder.th".format(path))
-        th.save(self.teacher_enemy_decoder.state_dict(), "{}/teacher_enemy_decoder.th".format(path))
-        th.save(self.teacher_query_encoder.state_dict(), "{}/teacher_query_encoder.th".format(path))
-        th.save(self.teacher_delta_q_head.state_dict(), "{}/teacher_delta_q_head.th".format(path))
         th.save(self.optimiser.state_dict(), "{}/opt.th".format(path))
-        th.save(self.teacher_optimiser.state_dict(), "{}/teacher_opt.th".format(path))
 
     def load_models(self, path):
         self.mac.load_models(path)
         self.target_mac.load_models(path)
         if self.mixer is not None:
             self.mixer.load_state_dict(th.load("{}/mixer.th".format(path), map_location=lambda storage, loc: storage))
-        enemy_path = "{}/teacher_enemy_encoder.th".format(path)
-        if os.path.exists(enemy_path):
-            self.teacher_enemy_encoder.load_state_dict(
-                th.load(enemy_path, map_location=lambda storage, loc: storage)
-            )
-        decoder_path = "{}/teacher_enemy_decoder.th".format(path)
-        if os.path.exists(decoder_path):
-            self.teacher_enemy_decoder.load_state_dict(
-                th.load(decoder_path, map_location=lambda storage, loc: storage)
-            )
-        query_path = "{}/teacher_query_encoder.th".format(path)
-        if os.path.exists(query_path):
-            self.teacher_query_encoder.load_state_dict(
-                th.load(query_path, map_location=lambda storage, loc: storage)
-            )
-        delta_path = "{}/teacher_delta_q_head.th".format(path)
-        if os.path.exists(delta_path):
-            self.teacher_delta_q_head.load_state_dict(
-                th.load(delta_path, map_location=lambda storage, loc: storage)
-            )
         opt_state = None
         opt_path = "{}/opt.th".format(path)
         if os.path.exists(opt_path):
@@ -787,15 +629,3 @@ class QLearnerTokenValueCVAEBelief:
             if not self._load_optimizer_state(self.optimiser, opt_state):
                 online_opt_state = self._optimizer_state_subset(opt_state, 0, len(self.online_params))
                 self._load_optimizer_state(self.optimiser, online_opt_state)
-
-        teacher_opt_path = "{}/teacher_opt.th".format(path)
-        if os.path.exists(teacher_opt_path):
-            teacher_opt_state = th.load(teacher_opt_path, map_location=lambda storage, loc: storage)
-            self._load_optimizer_state(self.teacher_optimiser, teacher_opt_state)
-        elif opt_state is not None:
-            teacher_opt_state = self._optimizer_state_subset(
-                opt_state,
-                len(self.online_params),
-                len(self.teacher_params),
-            )
-            self._load_optimizer_state(self.teacher_optimiser, teacher_opt_state)

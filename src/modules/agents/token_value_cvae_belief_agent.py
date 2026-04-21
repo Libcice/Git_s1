@@ -219,20 +219,21 @@ class TokenValueCVAEBeliefAgent(nn.Module):
         prior_belief_feat_raw = F.relu(self.belief_enemy_proj(prior_belief_mu))
         prior_belief_feat = prior_belief_feat_raw * prior_belief_conf
 
-        visible_enemy_feat = current_step["enemy_visible"].unsqueeze(-1).float() * real_enemy_feat
+        visible_enemy_mask = current_step["enemy_visible"].unsqueeze(-1).float()
+        hidden_enemy_mask = 1.0 - visible_enemy_mask
+        visible_enemy_feat = visible_enemy_mask * real_enemy_feat
+        visible_enemy_summary = visible_enemy_feat.sum(dim=1) / float(max(1, self.n_enemies))
+        student_hidden_summary = (hidden_enemy_mask * prior_belief_feat).sum(dim=1) / float(max(1, self.n_enemies))
         if self.use_belief_for_q:
-            fused_enemy_feat = current_step["enemy_visible"].unsqueeze(-1).float() * real_enemy_feat + (
-                1.0 - current_step["enemy_visible"].unsqueeze(-1).float()
-            ) * prior_belief_feat
+            enemy_summary = visible_enemy_summary + student_hidden_summary
         else:
-            fused_enemy_feat = visible_enemy_feat
+            enemy_summary = visible_enemy_summary
 
-        enemy_summary = fused_enemy_feat.mean(dim=1)
         q = self.q_head(th.cat([q_context, enemy_summary], dim=-1))
 
-        # Keep auxiliary value supervision from directly reshaping the online q_context.
-        q_context_expand = q_context.detach().unsqueeze(1).expand(-1, self.n_enemies, -1)
-        aux_belief_value = self.belief_value_head(th.cat([prior_belief_feat_raw, q_context_expand], dim=-1))
+        aux_belief_values = self.belief_value_head(
+            th.cat([student_hidden_summary, q_context.detach()], dim=-1)
+        )
 
         posterior_belief_mu = None
         posterior_belief_logvar = None
@@ -257,6 +258,6 @@ class TokenValueCVAEBeliefAgent(nn.Module):
             q_context,
             prior_belief_conf,
             real_enemy_feat,
-            prior_belief_feat_raw,
-            aux_belief_value,
+            prior_belief_feat,
+            aux_belief_values,
         )

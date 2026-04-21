@@ -178,7 +178,7 @@ class TokenValueCVAEBeliefMAC:
         self.prior_belief_confidence = prior_belief_confidence.view(bs, self.n_agents, self.args.enemy_num, -1)
         self.real_enemy_feat = real_enemy_feat.view(bs, self.n_agents, self.args.enemy_num, -1)
         self.prior_belief_feat = prior_belief_feat.view(bs, self.n_agents, self.args.enemy_num, -1)
-        self.aux_belief_values = aux_belief_values.view(bs, self.n_agents, self.args.enemy_num, -1)
+        self.aux_belief_values = aux_belief_values.view(bs, self.n_agents, -1)
 
         if posterior_belief_mu is not None:
             self.posterior_belief_mu = posterior_belief_mu.view(
