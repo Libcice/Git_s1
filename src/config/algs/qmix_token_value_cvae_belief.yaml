@@ -27,14 +27,14 @@ transformer_dropout: 0.0
 
 belief_prior_type: "conditional"
 belief_latent_dim: 16
-belief_loss_coef: 0.05
+belief_loss_coef: 0.01
 belief_posterior_coef: 0.25
 belief_kl_coef: 0.1
 belief_logvar_min: -3.0
 belief_logvar_max: 1.0
 belief_nll_clip: 2.0
-belief_confidence_center: -1.0
-belief_confidence_temp: 1.0
+belief_confidence_center: -2.2
+belief_confidence_temp: 1.5
 belief_warmup_t: 300000
 belief_kl_warmup_t: 300000
 belief_pretrain_t: 50000
@@ -42,11 +42,11 @@ belief_pretrain_only: False
 disable_belief: False
 use_belief_for_q: True
 
-belief_repr_coef: 0.05
-belief_aux_delta_q_coef: 0.1
+belief_repr_coef: 0.02
+belief_aux_delta_q_coef: 0.03
 belief_distill_importance_min: 0.25
-belief_distill_importance_max: 4.0
-belief_value_warmup_t: 300000
+belief_distill_importance_max: 2.0
+belief_value_warmup_t: 600000
 
 record_belief_summary: False
 

@@ -49,6 +49,7 @@ class TokenValueCVAEBeliefAgent(nn.Module):
             1e-6,
             float(getattr(args, "belief_confidence_temp", default_conf_temp)),
         )
+        self.hidden_summary_gate_floor = 0.5
 
         if self.hidden_dim % self.n_heads != 0:
             raise ValueError("transformer_hidden_dim must be divisible by transformer_heads")
@@ -138,6 +139,19 @@ class TokenValueCVAEBeliefAgent(nn.Module):
             (self.belief_confidence_center - avg_logvar) / self.belief_confidence_temp
         )
 
+    def _hidden_summary_gate(self, prior_belief_conf, hidden_enemy_mask):
+        hidden_count = hidden_enemy_mask.sum(dim=1)
+        hidden_conf_sum = (hidden_enemy_mask * prior_belief_conf).sum(dim=1)
+        hidden_conf_summary = th.where(
+            hidden_count > 0,
+            hidden_conf_sum / hidden_count.clamp(min=1.0),
+            th.ones_like(hidden_conf_sum),
+        )
+        hidden_summary_gate = self.hidden_summary_gate_floor + (
+            1.0 - self.hidden_summary_gate_floor
+        ) * hidden_conf_summary
+        return hidden_conf_summary, hidden_summary_gate
+
     def _encode_current_step(self, current_step, prev_memory):
         move_feat = F.relu(self.token_embed(current_step["move_token"]))
         self_feat = F.relu(self.token_embed(current_step["self_token"]))
@@ -217,13 +231,15 @@ class TokenValueCVAEBeliefAgent(nn.Module):
         else:
             prior_belief_conf = self._belief_confidence(prior_belief_logvar)
         prior_belief_feat_raw = F.relu(self.belief_enemy_proj(prior_belief_mu))
-        prior_belief_feat = prior_belief_feat_raw * prior_belief_conf
+        prior_belief_feat = prior_belief_feat_raw
 
         visible_enemy_mask = current_step["enemy_visible"].unsqueeze(-1).float()
         hidden_enemy_mask = 1.0 - visible_enemy_mask
         visible_enemy_feat = visible_enemy_mask * real_enemy_feat
         visible_enemy_summary = visible_enemy_feat.sum(dim=1) / float(max(1, self.n_enemies))
-        student_hidden_summary = (hidden_enemy_mask * prior_belief_feat).sum(dim=1) / float(max(1, self.n_enemies))
+        student_hidden_summary_raw = (hidden_enemy_mask * prior_belief_feat).sum(dim=1) / float(max(1, self.n_enemies))
+        _, hidden_summary_gate = self._hidden_summary_gate(prior_belief_conf, hidden_enemy_mask)
+        student_hidden_summary = student_hidden_summary_raw * hidden_summary_gate
         if self.use_belief_for_q:
             enemy_summary = visible_enemy_summary + student_hidden_summary
         else:

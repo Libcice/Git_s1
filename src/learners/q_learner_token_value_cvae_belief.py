@@ -119,7 +119,30 @@ class QLearnerTokenValueCVAEBelief:
         denom = mask.sum(dim=1).clamp(min=1.0)
         return (feats * mask).sum(dim=1) / denom
 
-    def _build_oracle_targets(self, q_context_t, real_enemy_feat_t, hidden_enemy_view, enemy_visible_t):
+    def _build_student_hidden_summary(self, prior_belief_feat_t, prior_belief_conf_t, enemy_visible_t):
+        hidden_enemy_mask_t = (1.0 - enemy_visible_t).unsqueeze(-1).float()
+        n_enemies = float(max(1, enemy_visible_t.size(2)))
+        student_hidden_summary_raw_t = (hidden_enemy_mask_t * prior_belief_feat_t).sum(dim=2) / n_enemies
+        hidden_count_t = hidden_enemy_mask_t.sum(dim=2)
+        hidden_conf_sum_t = (hidden_enemy_mask_t * prior_belief_conf_t).sum(dim=2)
+        hidden_conf_summary_t = th.where(
+            hidden_count_t > 0,
+            hidden_conf_sum_t / hidden_count_t.clamp(min=1.0),
+            th.ones_like(hidden_conf_sum_t),
+        )
+        gate_floor = float(getattr(self.mac.agent, "hidden_summary_gate_floor", 0.5))
+        hidden_summary_gate_t = gate_floor + (1.0 - gate_floor) * hidden_conf_summary_t
+        student_hidden_summary_t = student_hidden_summary_raw_t * hidden_summary_gate_t
+        return student_hidden_summary_t, hidden_conf_summary_t, hidden_summary_gate_t
+
+    def _build_oracle_targets(
+        self,
+        q_context_t,
+        real_enemy_feat_t,
+        hidden_enemy_view,
+        enemy_visible_t,
+        student_hidden_summary_t=None,
+    ):
         bs, n_agents, n_enemies, _ = hidden_enemy_view.shape
         target_agent = self.target_mac.agent
         with th.no_grad():
@@ -138,6 +161,14 @@ class QLearnerTokenValueCVAEBelief:
             q_visible_t = target_agent.q_head(
                 th.cat([q_context_detached_t, visible_enemy_summary_t], dim=-1).reshape(bs * n_agents, self.hidden_dim * 2)
             ).view(bs, n_agents, self.args.n_actions)
+            q_student_t = None
+            if student_hidden_summary_t is not None:
+                q_student_t = target_agent.q_head(
+                    th.cat(
+                        [q_context_detached_t, visible_enemy_summary_t + student_hidden_summary_t.detach()],
+                        dim=-1,
+                    ).reshape(bs * n_agents, self.hidden_dim * 2)
+                ).view(bs, n_agents, self.args.n_actions)
             q_oracle_t = target_agent.q_head(
                 th.cat([q_context_detached_t, visible_enemy_summary_t + oracle_hidden_summary_t], dim=-1).reshape(
                     bs * n_agents,
@@ -145,7 +176,20 @@ class QLearnerTokenValueCVAEBelief:
                 )
             ).view(bs, n_agents, self.args.n_actions)
             delta_q_target_t = q_oracle_t - q_visible_t
-        return oracle_hidden_feat_t, delta_q_target_t
+        return oracle_hidden_feat_t, delta_q_target_t, q_visible_t, q_student_t, q_oracle_t
+
+    def _belief_action_diagnostics(self, q_visible_t, q_student_t, q_oracle_t):
+        with th.no_grad():
+            a_vis_t = q_visible_t.argmax(dim=-1)
+            a_bel_t = q_student_t.argmax(dim=-1)
+            a_oracle_t = q_oracle_t.argmax(dim=-1)
+            help_t = ((a_vis_t != a_oracle_t) & (a_bel_t == a_oracle_t)).float()
+            drag_t = ((a_vis_t == a_oracle_t) & (a_bel_t != a_oracle_t)).float()
+            net_gain_t = help_t - drag_t
+            student_delta_t = q_student_t - q_visible_t
+            target_delta_t = q_oracle_t - q_visible_t
+            delta_cosine_t = F.cosine_similarity(student_delta_t, target_delta_t, dim=-1)
+        return help_t, drag_t, net_gain_t, delta_cosine_t
 
     def _build_distill_importance(self, delta_q_target_t, distill_mask_t):
         with th.no_grad():
@@ -252,6 +296,12 @@ class QLearnerTokenValueCVAEBelief:
         prior_raw_nll_denom = rewards.new_tensor(0.0)
         post_raw_nll_sum = rewards.new_tensor(0.0)
         post_raw_nll_denom = rewards.new_tensor(0.0)
+        belief_action_help_sum = rewards.new_tensor(0.0)
+        belief_action_drag_sum = rewards.new_tensor(0.0)
+        belief_action_net_gain_sum = rewards.new_tensor(0.0)
+        belief_action_metric_denom = rewards.new_tensor(0.0)
+        belief_delta_cosine_sum = rewards.new_tensor(0.0)
+        belief_delta_cosine_denom = rewards.new_tensor(0.0)
         repr_weight = 0.0
         aux_delta_q_weight = 0.0
         value_warm = min(1.0, float(t_env) / float(max(1, self.belief_value_warmup_t)))
@@ -404,15 +454,24 @@ class QLearnerTokenValueCVAEBelief:
                 valid_agent_mask_t = valid_step_mask_t.unsqueeze(1).expand(-1, self.args.n_agents)
                 q_context_t = target_q_context_cache[t]
                 real_enemy_feat_t = target_real_enemy_feat_cache[t]
-                oracle_hidden_feat_t, delta_q_target_t = self._build_oracle_targets(
+                student_hidden_summary_t, _, _ = self._build_student_hidden_summary(
+                    prior_belief_feat_t.detach(),
+                    prior_conf_t.detach(),
+                    enemy_visible_t,
+                )
+                oracle_hidden_feat_t, delta_q_target_t, q_visible_t, q_student_t, q_oracle_t = self._build_oracle_targets(
                     q_context_t,
                     real_enemy_feat_t,
                     hidden_enemy_view,
                     enemy_visible_t,
+                    student_hidden_summary_t=student_hidden_summary_t,
                 )
                 distill_agent_mask_t = hidden_present_t * valid_agent_mask_t
                 distill_importance_t = self._build_distill_importance(delta_q_target_t, distill_agent_mask_t)
                 oracle_delta_abs_t = delta_q_target_t.abs().mean(dim=-1)
+                belief_action_help_t, belief_action_drag_t, belief_action_net_gain_t, belief_delta_cosine_t = (
+                    self._belief_action_diagnostics(q_visible_t, q_student_t, q_oracle_t)
+                )
 
                 repr_error_t = F.smooth_l1_loss(
                     prior_belief_feat_t,
@@ -434,6 +493,12 @@ class QLearnerTokenValueCVAEBelief:
                 distill_importance_count = distill_importance_count + distill_agent_mask_t.sum()
                 oracle_delta_abs_sum = oracle_delta_abs_sum + (oracle_delta_abs_t * distill_agent_mask_t).sum()
                 oracle_delta_abs_denom = oracle_delta_abs_denom + distill_agent_mask_t.sum()
+                belief_action_help_sum = belief_action_help_sum + (belief_action_help_t * distill_agent_mask_t).sum()
+                belief_action_drag_sum = belief_action_drag_sum + (belief_action_drag_t * distill_agent_mask_t).sum()
+                belief_action_net_gain_sum = belief_action_net_gain_sum + (belief_action_net_gain_t * distill_agent_mask_t).sum()
+                belief_action_metric_denom = belief_action_metric_denom + distill_agent_mask_t.sum()
+                belief_delta_cosine_sum = belief_delta_cosine_sum + (belief_delta_cosine_t * distill_agent_mask_t).sum()
+                belief_delta_cosine_denom = belief_delta_cosine_denom + distill_agent_mask_t.sum()
 
         mac_out = th.stack(mac_out, dim=1)
 
@@ -495,6 +560,10 @@ class QLearnerTokenValueCVAEBelief:
         aux_delta_q_loss = aux_delta_q_loss_sum / aux_delta_q_loss_denom.clamp(min=1.0)
         distill_importance_mean = distill_importance_sum / distill_importance_count.clamp(min=1.0)
         oracle_delta_abs_mean = oracle_delta_abs_sum / oracle_delta_abs_denom.clamp(min=1.0)
+        belief_action_help_rate = belief_action_help_sum / belief_action_metric_denom.clamp(min=1.0)
+        belief_action_drag_rate = belief_action_drag_sum / belief_action_metric_denom.clamp(min=1.0)
+        belief_action_net_gain = belief_action_net_gain_sum / belief_action_metric_denom.clamp(min=1.0)
+        belief_delta_cosine = belief_delta_cosine_sum / belief_delta_cosine_denom.clamp(min=1.0)
 
         repr_weight = self.belief_repr_coef * value_warm if mac_value_active else 0.0
         aux_delta_q_weight = self.belief_aux_delta_q_coef * value_warm if mac_value_active else 0.0
@@ -570,6 +639,10 @@ class QLearnerTokenValueCVAEBelief:
             self.logger.log_stat("belief_aux_delta_q_weight", aux_delta_q_weight, t_env)
             self.logger.log_stat("belief_distill_importance_mean", distill_importance_mean.item(), t_env)
             self.logger.log_stat("belief_oracle_delta_abs_mean", oracle_delta_abs_mean.item(), t_env)
+            self.logger.log_stat("belief_action_help_rate", belief_action_help_rate.item(), t_env)
+            self.logger.log_stat("belief_action_drag_rate", belief_action_drag_rate.item(), t_env)
+            self.logger.log_stat("belief_action_net_gain", belief_action_net_gain.item(), t_env)
+            self.logger.log_stat("belief_delta_cosine", belief_delta_cosine.item(), t_env)
             self.logger.log_stat("belief_pretraining_active", float(belief_pretraining_active), t_env)
             self.logger.log_stat("belief_pretrain_only", float(self.belief_pretrain_only), t_env)
             self.logger.log_stat("belief_prior_state_mu_mean", prior_state_mu_sum.item() / prior_state_mu_count.clamp(min=1.0).item(), t_env)
