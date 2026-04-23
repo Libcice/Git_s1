@@ -1,3 +1,5 @@
+import math
+
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
@@ -85,6 +87,9 @@ class TokenValueCVAEBeliefAgent(nn.Module):
 
         self.real_enemy_proj = _build_mlp(self.hidden_dim, self.hidden_dim, self.hidden_dim)
         self.belief_enemy_proj = _build_mlp(self.enemy_state_feat_dim, self.hidden_dim, self.hidden_dim)
+        self.hidden_summary_query_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.hidden_summary_key_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.hidden_summary_value_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
         self.q_head = nn.Linear(self.hidden_dim * 2, args.n_actions)
         self.belief_value_head = nn.Sequential(
             nn.Linear(self.hidden_dim * 2, self.hidden_dim),
@@ -115,6 +120,21 @@ class TokenValueCVAEBeliefAgent(nn.Module):
         mask = mask.unsqueeze(-1).float()
         denom = mask.sum(dim=1).clamp(min=1.0)
         return (feats * mask).sum(dim=1) / denom
+
+    def _cross_attention_readout(self, query_context, slots, slot_mask, query_proj, key_proj, value_proj):
+        if slots.size(1) == 0:
+            return query_context.new_zeros(query_context.size(0), self.hidden_dim)
+
+        query = query_proj(query_context)
+        keys = key_proj(slots)
+        values = value_proj(slots)
+        scores = th.matmul(query.unsqueeze(1), keys.transpose(1, 2)).squeeze(1) / math.sqrt(keys.size(-1))
+        mask_bool = slot_mask > 0
+        scores = scores.masked_fill(~mask_bool, -1e9)
+        attn = th.softmax(scores, dim=-1)
+        attn = attn * mask_bool.float()
+        attn = attn / attn.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        return th.bmm(attn.unsqueeze(1), values).squeeze(1)
 
     def _reparameterize(self, mu, logvar):
         logvar = logvar.clamp(min=self.belief_logvar_min, max=self.belief_logvar_max)
@@ -237,7 +257,14 @@ class TokenValueCVAEBeliefAgent(nn.Module):
         hidden_enemy_mask = 1.0 - visible_enemy_mask
         visible_enemy_feat = visible_enemy_mask * real_enemy_feat
         visible_enemy_summary = visible_enemy_feat.sum(dim=1) / float(max(1, self.n_enemies))
-        student_hidden_summary_raw = (hidden_enemy_mask * prior_belief_feat).sum(dim=1) / float(max(1, self.n_enemies))
+        student_hidden_summary_raw = self._cross_attention_readout(
+            q_context,
+            prior_belief_feat,
+            hidden_enemy_mask.squeeze(-1),
+            self.hidden_summary_query_proj,
+            self.hidden_summary_key_proj,
+            self.hidden_summary_value_proj,
+        )
         _, hidden_summary_gate = self._hidden_summary_gate(prior_belief_conf, hidden_enemy_mask)
         student_hidden_summary = student_hidden_summary_raw * hidden_summary_gate
         if self.use_belief_for_q:
@@ -276,4 +303,6 @@ class TokenValueCVAEBeliefAgent(nn.Module):
             real_enemy_feat,
             prior_belief_feat,
             aux_belief_values,
+            student_hidden_summary,
+            visible_enemy_summary,
         )

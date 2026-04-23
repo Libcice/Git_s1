@@ -59,11 +59,11 @@ class QLearnerTokenValueCVAEBelief:
         self.belief_pretrain_t = getattr(self.args, "belief_pretrain_t", 50000)
         self.belief_pretrain_only = getattr(self.args, "belief_pretrain_only", False)
 
-        self.belief_repr_coef = getattr(self.args, "belief_repr_coef", 0.05)
-        self.belief_aux_delta_q_coef = getattr(self.args, "belief_aux_delta_q_coef", 0.1)
+        self.belief_repr_coef = getattr(self.args, "belief_repr_coef", 0.01)
+        self.belief_aux_delta_q_coef = getattr(self.args, "belief_aux_delta_q_coef", 0.015)
         self.belief_distill_importance_min = getattr(self.args, "belief_distill_importance_min", 0.25)
         self.belief_distill_importance_max = getattr(self.args, "belief_distill_importance_max", 4.0)
-        self.belief_value_warmup_t = getattr(self.args, "belief_value_warmup_t", 300000)
+        self.belief_value_warmup_t = getattr(self.args, "belief_value_warmup_t", 600000)
 
         self.disable_belief = getattr(self.args, "disable_belief", False)
         self.use_belief_for_q = getattr(self.args, "use_belief_for_q", True) and not self.disable_belief
@@ -119,26 +119,29 @@ class QLearnerTokenValueCVAEBelief:
         denom = mask.sum(dim=1).clamp(min=1.0)
         return (feats * mask).sum(dim=1) / denom
 
-    def _build_student_hidden_summary(self, prior_belief_feat_t, prior_belief_conf_t, enemy_visible_t):
-        hidden_enemy_mask_t = (1.0 - enemy_visible_t).unsqueeze(-1).float()
-        n_enemies = float(max(1, enemy_visible_t.size(2)))
-        student_hidden_summary_raw_t = (hidden_enemy_mask_t * prior_belief_feat_t).sum(dim=2) / n_enemies
-        hidden_count_t = hidden_enemy_mask_t.sum(dim=2)
-        hidden_conf_sum_t = (hidden_enemy_mask_t * prior_belief_conf_t).sum(dim=2)
-        hidden_conf_summary_t = th.where(
-            hidden_count_t > 0,
-            hidden_conf_sum_t / hidden_count_t.clamp(min=1.0),
-            th.ones_like(hidden_conf_sum_t),
-        )
-        gate_floor = float(getattr(self.mac.agent, "hidden_summary_gate_floor", 0.5))
-        hidden_summary_gate_t = gate_floor + (1.0 - gate_floor) * hidden_conf_summary_t
-        student_hidden_summary_t = student_hidden_summary_raw_t * hidden_summary_gate_t
-        return student_hidden_summary_t, hidden_conf_summary_t, hidden_summary_gate_t
+    def _target_q_from_enemy_summary(self, q_context_t, enemy_summary_t, allow_input_grad=False):
+        bs, n_agents, _ = q_context_t.shape
+        target_q_head = self.target_mac.agent.q_head
+        q_input_t = th.cat([q_context_t.detach(), enemy_summary_t], dim=-1).reshape(bs * n_agents, self.hidden_dim * 2)
+        linear_kwargs = {
+            "input": q_input_t,
+            "weight": target_q_head.weight.detach(),
+            "bias": None if target_q_head.bias is None else target_q_head.bias.detach(),
+        }
+        if allow_input_grad:
+            q_values_t = F.linear(**linear_kwargs)
+        else:
+            with th.no_grad():
+                q_values_t = F.linear(**linear_kwargs)
+        return q_values_t.view(bs, n_agents, self.args.n_actions)
+
+    def _gather_action_values(self, q_values_t, actions_t):
+        return th.gather(q_values_t, dim=-1, index=actions_t).squeeze(-1)
 
     def _build_oracle_targets(
         self,
         q_context_t,
-        real_enemy_feat_t,
+        visible_enemy_summary_t,
         hidden_enemy_view,
         enemy_visible_t,
         student_hidden_summary_t=None,
@@ -146,37 +149,35 @@ class QLearnerTokenValueCVAEBelief:
         bs, n_agents, n_enemies, _ = hidden_enemy_view.shape
         target_agent = self.target_mac.agent
         with th.no_grad():
-            visible_enemy_feat_t = enemy_visible_t.unsqueeze(-1).float() * real_enemy_feat_t.detach()
-            visible_enemy_summary_t = visible_enemy_feat_t.sum(dim=2) / float(max(1, n_enemies))
             oracle_hidden_feat_t = F.relu(
                 target_agent.belief_enemy_proj(
                     hidden_enemy_view.reshape(bs * n_agents * n_enemies, self.enemy_state_feat_dim)
                 )
-            ).view(bs, n_agents, n_enemies, self.hidden_dim)
-            q_context_detached_t = q_context_t.detach()
-            oracle_hidden_summary_t = (
-                ((1.0 - enemy_visible_t).unsqueeze(-1).float() * oracle_hidden_feat_t).sum(dim=2)
-                / float(max(1, n_enemies))
+            ).view(bs * n_agents, n_enemies, self.hidden_dim)
+            hidden_enemy_mask_t = (1.0 - enemy_visible_t).reshape(bs * n_agents, n_enemies).float()
+            oracle_hidden_summary_t = target_agent._cross_attention_readout(
+                q_context_t.reshape(bs * n_agents, self.hidden_dim),
+                oracle_hidden_feat_t,
+                hidden_enemy_mask_t,
+                target_agent.hidden_summary_query_proj,
+                target_agent.hidden_summary_key_proj,
+                target_agent.hidden_summary_value_proj,
+            ).view(bs, n_agents, self.hidden_dim)
+        q_visible_t = self._target_q_from_enemy_summary(q_context_t, visible_enemy_summary_t.detach())
+        q_student_t = None
+        if student_hidden_summary_t is not None:
+            q_student_t = self._target_q_from_enemy_summary(
+                q_context_t,
+                visible_enemy_summary_t.detach() + student_hidden_summary_t,
+                allow_input_grad=True,
             )
-            q_visible_t = target_agent.q_head(
-                th.cat([q_context_detached_t, visible_enemy_summary_t], dim=-1).reshape(bs * n_agents, self.hidden_dim * 2)
-            ).view(bs, n_agents, self.args.n_actions)
-            q_student_t = None
-            if student_hidden_summary_t is not None:
-                q_student_t = target_agent.q_head(
-                    th.cat(
-                        [q_context_detached_t, visible_enemy_summary_t + student_hidden_summary_t.detach()],
-                        dim=-1,
-                    ).reshape(bs * n_agents, self.hidden_dim * 2)
-                ).view(bs, n_agents, self.args.n_actions)
-            q_oracle_t = target_agent.q_head(
-                th.cat([q_context_detached_t, visible_enemy_summary_t + oracle_hidden_summary_t], dim=-1).reshape(
-                    bs * n_agents,
-                    self.hidden_dim * 2,
-                )
-            ).view(bs, n_agents, self.args.n_actions)
-            delta_q_target_t = q_oracle_t - q_visible_t
-        return oracle_hidden_feat_t, delta_q_target_t, q_visible_t, q_student_t, q_oracle_t
+        q_oracle_t = self._target_q_from_enemy_summary(
+            q_context_t,
+            visible_enemy_summary_t.detach() + oracle_hidden_summary_t.detach(),
+        )
+        delta_q_target_t = q_oracle_t - q_visible_t
+        student_delta_q_t = None if q_student_t is None else (q_student_t - q_visible_t)
+        return oracle_hidden_summary_t.detach(), delta_q_target_t.detach(), student_delta_q_t, q_visible_t.detach(), q_student_t, q_oracle_t.detach()
 
     def _belief_action_diagnostics(self, q_visible_t, q_student_t, q_oracle_t):
         with th.no_grad():
@@ -193,7 +194,10 @@ class QLearnerTokenValueCVAEBelief:
 
     def _build_distill_importance(self, delta_q_target_t, distill_mask_t):
         with th.no_grad():
-            raw_importance_t = delta_q_target_t.abs().mean(dim=-1)
+            if delta_q_target_t.dim() > distill_mask_t.dim():
+                raw_importance_t = delta_q_target_t.abs().mean(dim=-1)
+            else:
+                raw_importance_t = delta_q_target_t.abs()
             agent_count_t = distill_mask_t.sum(dim=-1, keepdim=True)
             mean_importance_t = (raw_importance_t * distill_mask_t).sum(dim=-1, keepdim=True) / agent_count_t.clamp(min=1.0)
             normalized_importance_t = raw_importance_t / mean_importance_t.clamp(min=1e-6)
@@ -311,12 +315,12 @@ class QLearnerTokenValueCVAEBelief:
 
         target_mac_out = None
         target_q_context_cache = None
-        target_real_enemy_feat_cache = None
+        target_visible_enemy_summary_cache = None
         if q_learning_active:
             target_mac_out = []
             if mac_value_active:
                 target_q_context_cache = []
-                target_real_enemy_feat_cache = []
+                target_visible_enemy_summary_cache = []
             self.target_mac.init_hidden(batch.batch_size)
             with th.no_grad():
                 for t in range(batch.max_seq_length):
@@ -324,7 +328,7 @@ class QLearnerTokenValueCVAEBelief:
                     target_mac_out.append(target_agent_outs)
                     if mac_value_active and t < batch.max_seq_length - 1:
                         target_q_context_cache.append(self.target_mac.get_q_context().detach())
-                        target_real_enemy_feat_cache.append(self.target_mac.get_real_enemy_feat().detach())
+                        target_visible_enemy_summary_cache.append(self.target_mac.get_visible_enemy_summary().detach())
 
         self.mac.init_hidden(batch.batch_size)
         for t in range(batch.max_seq_length):
@@ -352,9 +356,6 @@ class QLearnerTokenValueCVAEBelief:
             prior_state_mu_t, prior_state_logvar_t = self.mac.get_prior_belief_stats()
             prior_z_mu_t, prior_z_logvar_t = self.mac.get_prior_latent_stats()
             prior_conf_t = self.mac.get_prior_belief_confidence()
-            prior_belief_feat_t = self.mac.get_prior_belief_feat()
-            aux_belief_values_t = self.mac.get_aux_belief_values()
-
             prior_state_mu_sum = prior_state_mu_sum + prior_state_mu_t.mean()
             prior_state_mu_count = prior_state_mu_count + prior_state_mu_t.new_tensor(1.0)
             prior_state_logvar_sum = prior_state_logvar_sum + prior_state_logvar_t.mean()
@@ -453,40 +454,38 @@ class QLearnerTokenValueCVAEBelief:
                 valid_step_mask_t = mask[:, t, 0]
                 valid_agent_mask_t = valid_step_mask_t.unsqueeze(1).expand(-1, self.args.n_agents)
                 q_context_t = target_q_context_cache[t]
-                real_enemy_feat_t = target_real_enemy_feat_cache[t]
-                student_hidden_summary_t, _, _ = self._build_student_hidden_summary(
-                    prior_belief_feat_t.detach(),
-                    prior_conf_t.detach(),
-                    enemy_visible_t,
-                )
-                oracle_hidden_feat_t, delta_q_target_t, q_visible_t, q_student_t, q_oracle_t = self._build_oracle_targets(
+                visible_enemy_summary_t = target_visible_enemy_summary_cache[t]
+                student_hidden_summary_t = self.mac.get_student_hidden_summary()
+                oracle_hidden_summary_t, delta_q_target_t, student_delta_q_t, q_visible_t, q_student_t, q_oracle_t = self._build_oracle_targets(
                     q_context_t,
-                    real_enemy_feat_t,
+                    visible_enemy_summary_t,
                     hidden_enemy_view,
                     enemy_visible_t,
                     student_hidden_summary_t=student_hidden_summary_t,
                 )
                 distill_agent_mask_t = hidden_present_t * valid_agent_mask_t
-                distill_importance_t = self._build_distill_importance(delta_q_target_t, distill_agent_mask_t)
-                oracle_delta_abs_t = delta_q_target_t.abs().mean(dim=-1)
+                chosen_actions_t = actions[:, t]
+                delta_q_target_chosen_t = self._gather_action_values(delta_q_target_t, chosen_actions_t)
+                student_delta_q_chosen_t = self._gather_action_values(student_delta_q_t, chosen_actions_t)
+                distill_importance_t = self._build_distill_importance(delta_q_target_chosen_t, distill_agent_mask_t)
+                oracle_delta_abs_t = delta_q_target_chosen_t.abs()
                 belief_action_help_t, belief_action_drag_t, belief_action_net_gain_t, belief_delta_cosine_t = (
                     self._belief_action_diagnostics(q_visible_t, q_student_t, q_oracle_t)
                 )
 
                 repr_error_t = F.smooth_l1_loss(
-                    prior_belief_feat_t,
-                    oracle_hidden_feat_t.detach(),
+                    student_hidden_summary_t,
+                    oracle_hidden_summary_t,
                     reduction="none",
                 ).mean(dim=-1)
-                repr_slot_weight_t = hidden_mask_t * distill_importance_t.unsqueeze(-1)
-                repr_loss_sum = repr_loss_sum + (repr_error_t * repr_slot_weight_t).sum()
-                repr_loss_denom = repr_loss_denom + repr_slot_weight_t.sum()
+                repr_loss_sum = repr_loss_sum + (repr_error_t * distill_importance_t).sum()
+                repr_loss_denom = repr_loss_denom + distill_importance_t.sum()
 
                 aux_error_t = F.smooth_l1_loss(
-                    aux_belief_values_t,
-                    delta_q_target_t.detach(),
+                    student_delta_q_chosen_t,
+                    delta_q_target_chosen_t.detach(),
                     reduction="none",
-                ).mean(dim=-1)
+                )
                 aux_delta_q_loss_sum = aux_delta_q_loss_sum + (aux_error_t * distill_importance_t).sum()
                 aux_delta_q_loss_denom = aux_delta_q_loss_denom + distill_importance_t.sum()
                 distill_importance_sum = distill_importance_sum + distill_importance_t.sum()

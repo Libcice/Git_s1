@@ -31,6 +31,8 @@ class TokenValueCVAEBeliefMAC:
         self.real_enemy_feat = None
         self.prior_belief_feat = None
         self.aux_belief_values = None
+        self.student_hidden_summary = None
+        self.visible_enemy_summary = None
 
     def _setup_layout(self, scheme):
         env_args = getattr(self.args, "env_args", {})
@@ -165,6 +167,8 @@ class TokenValueCVAEBeliefMAC:
             real_enemy_feat,
             prior_belief_feat,
             aux_belief_values,
+            student_hidden_summary,
+            visible_enemy_summary,
         ) = self.agent(current, hidden, hidden_enemy_state=hidden_enemy_state)
 
         self.hidden_states = new_hidden.view(bs, self.n_agents, -1)
@@ -179,6 +183,8 @@ class TokenValueCVAEBeliefMAC:
         self.real_enemy_feat = real_enemy_feat.view(bs, self.n_agents, self.args.enemy_num, -1)
         self.prior_belief_feat = prior_belief_feat.view(bs, self.n_agents, self.args.enemy_num, -1)
         self.aux_belief_values = aux_belief_values.view(bs, self.n_agents, -1)
+        self.student_hidden_summary = student_hidden_summary.view(bs, self.n_agents, -1)
+        self.visible_enemy_summary = visible_enemy_summary.view(bs, self.n_agents, -1)
 
         if posterior_belief_mu is not None:
             self.posterior_belief_mu = posterior_belief_mu.view(
@@ -226,6 +232,8 @@ class TokenValueCVAEBeliefMAC:
         self.real_enemy_feat = None
         self.prior_belief_feat = None
         self.aux_belief_values = None
+        self.student_hidden_summary = None
+        self.visible_enemy_summary = None
 
     def get_q(self):
         return self.q
@@ -265,6 +273,12 @@ class TokenValueCVAEBeliefMAC:
 
     def get_aux_belief_values(self):
         return self.aux_belief_values
+
+    def get_student_hidden_summary(self):
+        return self.student_hidden_summary
+
+    def get_visible_enemy_summary(self):
+        return self.visible_enemy_summary
 
     def parameters(self):
         return self.agent.parameters()

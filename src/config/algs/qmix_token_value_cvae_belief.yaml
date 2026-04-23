@@ -42,8 +42,8 @@ belief_pretrain_only: False
 disable_belief: False
 use_belief_for_q: True
 
-belief_repr_coef: 0.02
-belief_aux_delta_q_coef: 0.03
+belief_repr_coef: 0.01
+belief_aux_delta_q_coef: 0.015
 belief_distill_importance_min: 0.25
 belief_distill_importance_max: 2.0
 belief_value_warmup_t: 600000
