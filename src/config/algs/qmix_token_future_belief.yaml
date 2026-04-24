@@ -1,0 +1,55 @@
+# --- QMIX + token-history encoder + action-conditioned future belief ---
+
+action_selector: "epsilon_greedy"
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 50000
+
+runner: "episode"
+buffer_size: 2000
+target_update_interval: 200
+
+agent_output_type: "q"
+learner: "q_learner_token_future_belief"
+double_q: True
+mixer: "qmix"
+mixing_embed_dim: 32
+hypernet_layers: 2
+hypernet_embed: 64
+
+mac: "token_future_belief_mac"
+agent: "token_future_belief"
+
+transformer_hidden_dim: 48
+transformer_heads: 4
+transformer_layers: 2
+transformer_dropout: 0.0
+future_repr_dim: 16
+
+belief_prior_type: "conditional"
+belief_latent_dim: 16
+belief_loss_coef: 0.01
+belief_current_coef: 1.0
+belief_future_coef: 1.0
+belief_posterior_coef: 0.25
+belief_kl_coef: 0.1
+belief_logvar_min: -3.0
+belief_logvar_max: 1.0
+belief_nll_clip: 2.0
+belief_confidence_center: -2.2
+belief_confidence_temp: 1.5
+belief_warmup_t: 300000
+belief_kl_warmup_t: 300000
+belief_pretrain_t: 50000
+belief_pretrain_only: False
+belief_future_q_warmup_t: 600000
+current_base_gate_floor: 0.1
+belief_alive_gate_floor: 0.05
+future_gate_floor: 0.0
+future_gate_init_bias: -4.0
+future_repr_mask: "next_hidden"
+future_delta_value_coef: 0.0
+disable_belief: False
+use_belief_for_q: True
+
+name: "qmix_token_future_belief"

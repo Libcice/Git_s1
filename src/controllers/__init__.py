@@ -20,6 +20,8 @@ from .token_latent_belief_controller import TokenLatentBeliefMAC
 REGISTRY["token_latent_belief_mac"] = TokenLatentBeliefMAC
 from .token_cvae_belief_controller import TokenCVAEBeliefMAC
 REGISTRY["token_cvae_belief_mac"] = TokenCVAEBeliefMAC
+from .token_future_belief_controller import TokenFutureBeliefMAC
+REGISTRY["token_future_belief_mac"] = TokenFutureBeliefMAC
 from .token_value_belief_controller import TokenValueBeliefMAC
 REGISTRY["token_value_belief_mac"] = TokenValueBeliefMAC
 from .token_value_cvae_belief_controller import TokenValueCVAEBeliefMAC

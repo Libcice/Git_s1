@@ -37,6 +37,8 @@ from .token_latent_belief_agent import TokenLatentBeliefAgent
 REGISTRY["token_latent_belief"] = TokenLatentBeliefAgent
 from .token_cvae_belief_agent import TokenCVAEBeliefAgent
 REGISTRY["token_cvae_belief"] = TokenCVAEBeliefAgent
+from .token_future_belief_agent import TokenFutureBeliefAgent
+REGISTRY["token_future_belief"] = TokenFutureBeliefAgent
 from .token_value_belief_agent import TokenValueBeliefAgent
 REGISTRY["token_value_belief"] = TokenValueBeliefAgent
 from .token_value_cvae_belief_agent import TokenValueCVAEBeliefAgent
