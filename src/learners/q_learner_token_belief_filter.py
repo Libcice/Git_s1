@@ -60,7 +60,8 @@ class QLearnerTokenBeliefFilter:
         self.belief_delta_warmup_t = getattr(self.args, "belief_delta_warmup_t", 600000)
         self.belief_logvar_min = getattr(self.args, "belief_logvar_min", -3.0)
         self.belief_logvar_max = getattr(self.args, "belief_logvar_max", 1.0)
-        self.belief_nll_clip = getattr(self.args, "belief_nll_clip", 2.0)
+        self.belief_nll_error_scale = getattr(self.args, "belief_nll_error_scale", 5.0)
+        self.belief_nll_clip = getattr(self.args, "belief_nll_clip", 5.0)
         self.belief_delta_q_clip = getattr(self.args, "belief_delta_q_clip", 1.0)
 
         self.optimiser = RMSprop(params=self.params, lr=args.lr, alpha=args.optim_alpha, eps=args.optim_eps)
@@ -93,9 +94,16 @@ class QLearnerTokenBeliefFilter:
 
     def _gaussian_nll(self, target, mu, logvar):
         logvar = logvar.clamp(min=self.belief_logvar_min, max=self.belief_logvar_max)
-        nll = 0.5 * ((target - mu).pow(2) * th.exp(-logvar) + logvar)
+        # The state features are small/normalised, so unscaled Gaussian NLL can
+        # collapse to zero after the log-variance term is shifted/clipped. Scale
+        # only the prediction error while keeping logvar as the uncertainty term.
+        scaled_diff = (target - mu) * self.belief_nll_error_scale
+        nll = 0.5 * (scaled_diff.pow(2) * th.exp(-logvar) + logvar)
         nll = nll.mean(dim=-1)
-        return nll.clamp(min=0.0, max=self.belief_nll_clip)
+        # Shift by the minimum possible logvar contribution instead of clamping
+        # at zero, so near-correct predictions still keep meaningful gradients.
+        nll = nll - 0.5 * self.belief_logvar_min
+        return nll.clamp(max=self.belief_nll_clip)
 
     def _masked_mean_loss(self, values, mask):
         denom = mask.sum().clamp(min=1.0)
@@ -195,6 +203,8 @@ class QLearnerTokenBeliefFilter:
         belief_mask = hidden_mask[:, :-1] * time_agent_mask.unsqueeze(-1)
         belief_nll = self._gaussian_nll(state_target[:, :-1], belief_mu[:, :-1], belief_logvar[:, :-1])
         belief_loss = self._masked_mean_loss(belief_nll, belief_mask)
+        belief_abs_error = (state_target[:, :-1] - belief_mu[:, :-1]).abs().mean(dim=-1)
+        belief_abs_error_mean = self._masked_mean_loss(belief_abs_error, belief_mask)
         visible_mask = enemy_visible[:, :-1] * alive[:, :-1] * time_agent_mask.unsqueeze(-1)
         visible_loss = self._masked_mean_loss(belief_nll, visible_mask)
 
@@ -204,6 +214,8 @@ class QLearnerTokenBeliefFilter:
         future_mask = future_hidden_mask * future_valid_mask.unsqueeze(-1)
         future_nll = self._gaussian_nll(future_target, future_mu[:, :-1], future_logvar[:, :-1])
         future_loss = self._masked_mean_loss(future_nll, future_mask)
+        future_abs_error = (future_target - future_mu[:, :-1]).abs().mean(dim=-1)
+        future_abs_error_mean = self._masked_mean_loss(future_abs_error, future_mask)
 
         with th.no_grad():
             flat_q_context = q_context[:, :-1].reshape(-1, q_context.size(-1))
@@ -259,8 +271,10 @@ class QLearnerTokenBeliefFilter:
             self.logger.log_stat("loss", loss.item(), t_env)
             self.logger.log_stat("q_loss", q_loss.item(), t_env)
             self.logger.log_stat("belief_loss", belief_loss.item(), t_env)
+            self.logger.log_stat("belief_abs_error", belief_abs_error_mean.item(), t_env)
             self.logger.log_stat("belief_visible_loss", visible_loss.item(), t_env)
             self.logger.log_stat("belief_future_loss", future_loss.item(), t_env)
+            self.logger.log_stat("belief_future_abs_error", future_abs_error_mean.item(), t_env)
             self.logger.log_stat("belief_delta_q_loss", delta_q_loss.item(), t_env)
             self.logger.log_stat("belief_weight", belief_weight, t_env)
             self.logger.log_stat("belief_visible_weight", visible_weight, t_env)

@@ -37,7 +37,8 @@ belief_future_warmup_t: 300000
 belief_delta_warmup_t: 600000
 belief_logvar_min: -3.0
 belief_logvar_max: 1.0
-belief_nll_clip: 2.0
+belief_nll_error_scale: 5.0
+belief_nll_clip: 5.0
 belief_delta_q_clip: 1.0
 
 name: "qmix_token_belief_filter"
