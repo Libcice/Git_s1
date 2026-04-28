@@ -16,6 +16,8 @@ from .history_token_transformer_belief_controller import HistoryTokenTransformer
 REGISTRY["history_token_transformer_belief_mac"] = HistoryTokenTransformerBeliefMAC
 from .token_transformer_belief_controller import TokenTransformerBeliefMAC
 REGISTRY["token_transformer_belief_mac"] = TokenTransformerBeliefMAC
+from .token_belief_filter_controller import TokenBeliefFilterMAC
+REGISTRY["token_belief_filter_mac"] = TokenBeliefFilterMAC
 from .token_latent_belief_controller import TokenLatentBeliefMAC
 REGISTRY["token_latent_belief_mac"] = TokenLatentBeliefMAC
 from .token_cvae_belief_controller import TokenCVAEBeliefMAC

@@ -33,6 +33,8 @@ from .history_token_transformer_belief_agent import HistoryTokenTransformerBelie
 REGISTRY["history_token_transformer_belief"] = HistoryTokenTransformerBeliefAgent
 from .token_transformer_belief_agent import TokenTransformerBeliefAgent
 REGISTRY["token_transformer_belief"] = TokenTransformerBeliefAgent
+from .token_belief_filter_agent import TokenBeliefFilterAgent
+REGISTRY["token_belief_filter"] = TokenBeliefFilterAgent
 from .token_latent_belief_agent import TokenLatentBeliefAgent
 REGISTRY["token_latent_belief"] = TokenLatentBeliefAgent
 from .token_cvae_belief_agent import TokenCVAEBeliefAgent

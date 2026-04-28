@@ -1,0 +1,43 @@
+# --- QMIX + token Transformer memory + entity belief filter ---
+
+action_selector: "epsilon_greedy"
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 50000
+
+runner: "episode"
+buffer_size: 2000
+target_update_interval: 200
+
+agent_output_type: "q"
+learner: "q_learner_token_belief_filter"
+double_q: True
+mixer: "qmix"
+mixing_embed_dim: 32
+hypernet_layers: 2
+hypernet_embed: 64
+
+mac: "token_belief_filter_mac"
+agent: "token_belief_filter"
+
+transformer_hidden_dim: 48
+transformer_heads: 4
+transformer_layers: 2
+transformer_dropout: 0.0
+
+use_belief_for_q: True
+belief_delta_gate_scale: 0.5
+belief_loss_coef: 0.005
+belief_visible_coef: 0.001
+belief_future_coef: 0.005
+belief_delta_q_coef: 0.005
+belief_warmup_t: 300000
+belief_visible_warmup_t: 300000
+belief_future_warmup_t: 300000
+belief_delta_warmup_t: 600000
+belief_logvar_min: -3.0
+belief_logvar_max: 1.0
+belief_nll_clip: 2.0
+belief_delta_q_clip: 1.0
+
+name: "qmix_token_belief_filter"

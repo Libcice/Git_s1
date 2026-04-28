@@ -47,6 +47,8 @@ REGISTRY["q_learner_history_token_belief"] = QLearnerHistoryTokenBelief
 
 from .q_learner_token_belief import QLearnerTokenBelief
 REGISTRY["q_learner_token_belief"] = QLearnerTokenBelief
+from .q_learner_token_belief_filter import QLearnerTokenBeliefFilter
+REGISTRY["q_learner_token_belief_filter"] = QLearnerTokenBeliefFilter
 from .q_learner_token_cvae_belief import QLearnerTokenCVAEBelief
 REGISTRY["q_learner_token_cvae_belief"] = QLearnerTokenCVAEBelief
 from .q_learner_token_future_belief import QLearnerTokenFutureBelief
