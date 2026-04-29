@@ -259,24 +259,18 @@ class TokenBeliefFilterAgent(nn.Module):
             q = base_q
 
         info = {
-            "prior_mu": prior_mu,
-            "prior_logvar": prior_logvar,
             "belief_mu": belief_mu,
             "belief_logvar": belief_logvar,
-            "prior_feat": prior_feat,
-            "belief_feat": belief_feat,
             "future_mu": future_mu,
             "future_logvar": future_logvar,
-            "q_context": q_context,
-            "visible_enemy_summary": visible_enemy_summary,
-            "base_q": base_q,
+            # These tensors are only used for oracle targets/logging in the
+            # learner, so avoid retaining their forward graph across the whole
+            # episode. The actual Q graph is already retained through q/mac_out.
+            "q_context": q_context.detach(),
+            "base_q": base_q.detach(),
             "belief_delta_q": belief_delta_q,
             "belief_gate": belief_gate,
-            "belief_readout": belief_readout,
-            "belief_attn": attn_weights,
-            "belief_confidence": confidence,
-            "belief_confidence_summary": confidence_summary,
-            "enemy_visible": current_step["enemy_visible"].float(),
-            "correction_alpha": alpha.squeeze(-1),
+            "belief_confidence": confidence.detach(),
+            "correction_alpha": alpha.squeeze(-1).detach(),
         }
         return q, memory, belief_mu, belief_logvar, belief_feat, info

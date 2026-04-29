@@ -16,6 +16,7 @@ class TokenBeliefFilterMAC:
         self.args = args
         self.agent_output_type = args.agent_output_type
         self.action_selector = action_REGISTRY[args.action_selector](args)
+        self.detach_recurrent_belief = getattr(args, "belief_detach_recurrent_state", True)
 
         self._setup_layout(scheme)
         self._build_agents(self.token_dim)
@@ -176,6 +177,10 @@ class TokenBeliefFilterMAC:
         prev_mu = self.belief_mu.reshape(bs * self.n_agents, self.args.enemy_num, self.enemy_state_feat_dim)
         prev_logvar = self.belief_logvar.reshape(bs * self.n_agents, self.args.enemy_num, self.enemy_state_feat_dim)
         prev_feat = self.belief_feat.reshape(bs * self.n_agents, self.args.enemy_num, -1)
+        if self.detach_recurrent_belief:
+            prev_mu = prev_mu.detach()
+            prev_logvar = prev_logvar.detach()
+            prev_feat = prev_feat.detach()
 
         agent_outs, new_hidden, belief_mu, belief_logvar, belief_feat, info = self.agent(
             step_tokens,
@@ -187,10 +192,13 @@ class TokenBeliefFilterMAC:
         )
 
         self.hidden_states = new_hidden.view(bs, self.n_agents, -1)
-        self.belief_mu = belief_mu.view(bs, self.n_agents, self.args.enemy_num, self.enemy_state_feat_dim)
-        self.belief_logvar = belief_logvar.view(bs, self.n_agents, self.args.enemy_num, self.enemy_state_feat_dim)
-        self.belief_feat = belief_feat.view(bs, self.n_agents, self.args.enemy_num, -1)
         self.last_info = self._reshape_info(info, bs)
+        next_belief_mu = belief_mu.detach() if self.detach_recurrent_belief else belief_mu
+        next_belief_logvar = belief_logvar.detach() if self.detach_recurrent_belief else belief_logvar
+        next_belief_feat = belief_feat.detach() if self.detach_recurrent_belief else belief_feat
+        self.belief_mu = next_belief_mu.view(bs, self.n_agents, self.args.enemy_num, self.enemy_state_feat_dim)
+        self.belief_logvar = next_belief_logvar.view(bs, self.n_agents, self.args.enemy_num, self.enemy_state_feat_dim)
+        self.belief_feat = next_belief_feat.view(bs, self.n_agents, self.args.enemy_num, -1)
 
         padded_belief = th.zeros(bs, self.n_agents, self.args.state_shape, device=ep_batch.device)
         flat_enemy_belief = self.belief_mu.reshape(bs, self.n_agents, -1)

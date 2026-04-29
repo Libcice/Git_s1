@@ -26,6 +26,7 @@ transformer_layers: 2
 transformer_dropout: 0.0
 
 use_belief_for_q: True
+belief_detach_recurrent_state: True
 belief_delta_gate_scale: 0.5
 belief_loss_coef: 0.005
 belief_visible_coef: 0.001
