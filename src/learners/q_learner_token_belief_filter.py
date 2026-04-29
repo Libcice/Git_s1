@@ -109,9 +109,6 @@ class QLearnerTokenBeliefFilter:
         denom = mask.sum().clamp(min=1.0)
         return (values * mask).sum() / denom
 
-    def _stack_info(self, infos, key):
-        return th.stack([info[key] for info in infos], dim=1)
-
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int):
         rewards = batch["reward"][:, :-1]
         actions = batch["actions"][:, :-1]
@@ -120,13 +117,109 @@ class QLearnerTokenBeliefFilter:
         mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
         avail_actions = batch["avail_actions"]
 
+        enemy_state = self._enemy_state(batch)
+        state_target = enemy_state.unsqueeze(2).expand(-1, -1, self.args.n_agents, -1, -1)
+        enemy_visible = self._enemy_visible(batch)
+        alive = (state_target[..., 0] > 0).float()
+
         mac_out = []
-        infos = []
+        belief_loss_sum = rewards.new_tensor(0.0)
+        belief_loss_denom = rewards.new_tensor(0.0)
+        visible_loss_sum = rewards.new_tensor(0.0)
+        visible_loss_denom = rewards.new_tensor(0.0)
+        future_loss_sum = rewards.new_tensor(0.0)
+        future_loss_denom = rewards.new_tensor(0.0)
+        delta_q_loss_sum = rewards.new_tensor(0.0)
+        delta_q_loss_denom = rewards.new_tensor(0.0)
+        belief_abs_error_sum = rewards.new_tensor(0.0)
+        belief_abs_error_denom = rewards.new_tensor(0.0)
+        future_abs_error_sum = rewards.new_tensor(0.0)
+        future_abs_error_denom = rewards.new_tensor(0.0)
+        hidden_frac_sum = rewards.new_tensor(0.0)
+        visible_frac_sum = rewards.new_tensor(0.0)
+        future_hidden_frac_sum = rewards.new_tensor(0.0)
+        gate_sum = rewards.new_tensor(0.0)
+        delta_abs_sum = rewards.new_tensor(0.0)
+        oracle_delta_abs_sum = rewards.new_tensor(0.0)
+        confidence_sum = rewards.new_tensor(0.0)
+        correction_alpha_sum = rewards.new_tensor(0.0)
+        base_q_abs_sum = rewards.new_tensor(0.0)
+        metric_count = rewards.new_tensor(0.0)
+
         self.mac.init_hidden(batch.batch_size)
         for t in range(batch.max_seq_length):
             agent_outs = self.mac.forward(batch, t=t)
             mac_out.append(agent_outs)
-            infos.append(self.mac.get_belief_filter_info())
+            info = self.mac.get_belief_filter_info()
+            if t < batch.max_seq_length - 1:
+                valid_agent_mask_t = mask[:, t].expand(-1, self.args.n_agents)
+                target_t = state_target[:, t]
+                visible_t = enemy_visible[:, t]
+                alive_t = alive[:, t]
+                hidden_mask_t = (1.0 - visible_t) * alive_t
+                belief_mask_t = hidden_mask_t * valid_agent_mask_t.unsqueeze(-1)
+                belief_nll_t = self._gaussian_nll(target_t, info["belief_mu"], info["belief_logvar"])
+                belief_loss_sum = belief_loss_sum + (belief_nll_t * belief_mask_t).sum()
+                belief_loss_denom = belief_loss_denom + belief_mask_t.sum()
+                belief_abs_error_t = (target_t - info["belief_mu"]).abs().mean(dim=-1)
+                belief_abs_error_sum = belief_abs_error_sum + (belief_abs_error_t * belief_mask_t).sum()
+                belief_abs_error_denom = belief_abs_error_denom + belief_mask_t.sum()
+
+                visible_mask_t = visible_t * alive_t * valid_agent_mask_t.unsqueeze(-1)
+                visible_loss_sum = visible_loss_sum + (belief_nll_t * visible_mask_t).sum()
+                visible_loss_denom = visible_loss_denom + visible_mask_t.sum()
+
+                future_target_t = state_target[:, t + 1]
+                future_hidden_mask_t = (1.0 - enemy_visible[:, t + 1]) * alive[:, t + 1]
+                future_valid_t = valid_agent_mask_t * (1.0 - terminated[:, t, 0]).unsqueeze(-1)
+                future_mask_t = future_hidden_mask_t * future_valid_t.unsqueeze(-1)
+                future_nll_t = self._gaussian_nll(
+                    future_target_t,
+                    info["future_mu"],
+                    info["future_logvar"],
+                )
+                future_loss_sum = future_loss_sum + (future_nll_t * future_mask_t).sum()
+                future_loss_denom = future_loss_denom + future_mask_t.sum()
+                future_abs_error_t = (future_target_t - info["future_mu"]).abs().mean(dim=-1)
+                future_abs_error_sum = future_abs_error_sum + (future_abs_error_t * future_mask_t).sum()
+                future_abs_error_denom = future_abs_error_denom + future_mask_t.sum()
+
+                with th.no_grad():
+                    flat_q_context = info["q_context"].reshape(-1, info["q_context"].size(-1))
+                    flat_enemy_state = target_t.reshape(-1, self.args.enemy_num, self.enemy_state_feat_dim)
+                    flat_hidden_mask = hidden_mask_t.reshape(-1, self.args.enemy_num)
+                    oracle_delta_q, oracle_gate, _, _ = self.target_mac.agent.compute_oracle_delta_q(
+                        flat_q_context,
+                        flat_enemy_state,
+                        flat_hidden_mask,
+                    )
+                    oracle_contrib_t = (oracle_delta_q * oracle_gate).view(
+                        batch.batch_size,
+                        self.args.n_agents,
+                        self.args.n_actions,
+                    ).clamp(min=-self.belief_delta_q_clip, max=self.belief_delta_q_clip)
+
+                student_contrib_t = info["belief_delta_q"] * info["belief_gate"]
+                hidden_present_t = hidden_mask_t.sum(dim=-1).gt(0).float()
+                delta_mask_t = (
+                    valid_agent_mask_t.unsqueeze(-1)
+                    * hidden_present_t.unsqueeze(-1)
+                    * avail_actions[:, t].float()
+                )
+                delta_error_t = F.smooth_l1_loss(student_contrib_t, oracle_contrib_t, reduction="none")
+                delta_q_loss_sum = delta_q_loss_sum + (delta_error_t * delta_mask_t).sum()
+                delta_q_loss_denom = delta_q_loss_denom + delta_mask_t.sum()
+
+                hidden_frac_sum = hidden_frac_sum + belief_mask_t.mean()
+                visible_frac_sum = visible_frac_sum + visible_mask_t.mean()
+                future_hidden_frac_sum = future_hidden_frac_sum + future_mask_t.mean()
+                gate_sum = gate_sum + info["belief_gate"].detach().mean()
+                delta_abs_sum = delta_abs_sum + student_contrib_t.detach().abs().mean()
+                oracle_delta_abs_sum = oracle_delta_abs_sum + oracle_contrib_t.detach().abs().mean()
+                confidence_sum = confidence_sum + info["belief_confidence"].mean()
+                correction_alpha_sum = correction_alpha_sum + info["correction_alpha"].mean()
+                base_q_abs_sum = base_q_abs_sum + info["base_q"].abs().mean()
+                metric_count = metric_count + 1.0
         mac_out = th.stack(mac_out, dim=1)
 
         chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)
@@ -182,67 +275,22 @@ class QLearnerTokenBeliefFilter:
         masked_td_error = td_error * q_mask
         q_loss = (masked_td_error ** 2).sum() / q_mask.sum()
 
-        enemy_state = self._enemy_state(batch)
-        state_target = enemy_state.unsqueeze(2).expand(-1, -1, self.args.n_agents, -1, -1)
-        enemy_visible = self._enemy_visible(batch)
-        alive = (state_target[..., 0] > 0).float()
-        time_agent_mask = mask.unsqueeze(2).expand(-1, -1, self.args.n_agents, -1).squeeze(-1)
-
-        belief_mu = self._stack_info(infos, "belief_mu")
-        belief_logvar = self._stack_info(infos, "belief_logvar")
-        future_mu = self._stack_info(infos, "future_mu")
-        future_logvar = self._stack_info(infos, "future_logvar")
-        q_context = self._stack_info(infos, "q_context")
-        belief_delta_q = self._stack_info(infos, "belief_delta_q")
-        belief_gate = self._stack_info(infos, "belief_gate")
-        base_q = self._stack_info(infos, "base_q")
-        correction_alpha = self._stack_info(infos, "correction_alpha")
-        belief_confidence = self._stack_info(infos, "belief_confidence")
-
-        hidden_mask = (1.0 - enemy_visible) * alive
-        belief_mask = hidden_mask[:, :-1] * time_agent_mask.unsqueeze(-1)
-        belief_nll = self._gaussian_nll(state_target[:, :-1], belief_mu[:, :-1], belief_logvar[:, :-1])
-        belief_loss = self._masked_mean_loss(belief_nll, belief_mask)
-        belief_abs_error = (state_target[:, :-1] - belief_mu[:, :-1]).abs().mean(dim=-1)
-        belief_abs_error_mean = self._masked_mean_loss(belief_abs_error, belief_mask)
-        visible_mask = enemy_visible[:, :-1] * alive[:, :-1] * time_agent_mask.unsqueeze(-1)
-        visible_loss = self._masked_mean_loss(belief_nll, visible_mask)
-
-        future_target = state_target[:, 1:]
-        future_hidden_mask = (1.0 - enemy_visible[:, 1:]) * alive[:, 1:]
-        future_valid_mask = time_agent_mask * (1.0 - terminated.squeeze(-1)).unsqueeze(-1)
-        future_mask = future_hidden_mask * future_valid_mask.unsqueeze(-1)
-        future_nll = self._gaussian_nll(future_target, future_mu[:, :-1], future_logvar[:, :-1])
-        future_loss = self._masked_mean_loss(future_nll, future_mask)
-        future_abs_error = (future_target - future_mu[:, :-1]).abs().mean(dim=-1)
-        future_abs_error_mean = self._masked_mean_loss(future_abs_error, future_mask)
-
-        with th.no_grad():
-            flat_q_context = q_context[:, :-1].reshape(-1, q_context.size(-1))
-            flat_enemy_state = state_target[:, :-1].reshape(-1, self.args.enemy_num, self.enemy_state_feat_dim)
-            flat_hidden_mask = hidden_mask[:, :-1].reshape(-1, self.args.enemy_num)
-            oracle_delta_q, oracle_gate, _, _ = self.target_mac.agent.compute_oracle_delta_q(
-                flat_q_context,
-                flat_enemy_state,
-                flat_hidden_mask,
-            )
-            oracle_contrib = oracle_delta_q * oracle_gate
-            oracle_contrib = oracle_contrib.view(
-                batch.batch_size,
-                batch.max_seq_length - 1,
-                self.args.n_agents,
-                self.args.n_actions,
-            ).clamp(min=-self.belief_delta_q_clip, max=self.belief_delta_q_clip)
-
-        student_contrib = belief_delta_q[:, :-1] * belief_gate[:, :-1]
-        hidden_present = hidden_mask[:, :-1].sum(dim=-1).gt(0).float()
-        delta_mask = (
-            time_agent_mask.unsqueeze(-1)
-            * hidden_present.unsqueeze(-1)
-            * avail_actions[:, :-1].float()
-        )
-        delta_error = F.smooth_l1_loss(student_contrib, oracle_contrib, reduction="none")
-        delta_q_loss = self._masked_mean_loss(delta_error, delta_mask)
+        belief_loss = belief_loss_sum / belief_loss_denom.clamp(min=1.0)
+        visible_loss = visible_loss_sum / visible_loss_denom.clamp(min=1.0)
+        future_loss = future_loss_sum / future_loss_denom.clamp(min=1.0)
+        delta_q_loss = delta_q_loss_sum / delta_q_loss_denom.clamp(min=1.0)
+        belief_abs_error_mean = belief_abs_error_sum / belief_abs_error_denom.clamp(min=1.0)
+        future_abs_error_mean = future_abs_error_sum / future_abs_error_denom.clamp(min=1.0)
+        metric_denom = metric_count.clamp(min=1.0)
+        belief_hidden_frac = hidden_frac_sum / metric_denom
+        belief_visible_frac = visible_frac_sum / metric_denom
+        belief_future_hidden_frac = future_hidden_frac_sum / metric_denom
+        belief_gate_mean = gate_sum / metric_denom
+        belief_delta_abs_mean = delta_abs_sum / metric_denom
+        belief_oracle_delta_abs_mean = oracle_delta_abs_sum / metric_denom
+        belief_confidence_mean = confidence_sum / metric_denom
+        belief_correction_alpha_mean = correction_alpha_sum / metric_denom
+        base_q_abs_mean = base_q_abs_sum / metric_denom
 
         belief_weight = self._warmup(self.belief_loss_coef, t_env, self.belief_warmup_t)
         visible_weight = self._warmup(self.belief_visible_coef, t_env, self.belief_visible_warmup_t)
@@ -281,15 +329,15 @@ class QLearnerTokenBeliefFilter:
             self.logger.log_stat("belief_future_weight", future_weight, t_env)
             self.logger.log_stat("belief_delta_q_weight", delta_q_weight, t_env)
             self.logger.log_stat("belief_aux_q_ratio", aux_q_ratio.item(), t_env)
-            self.logger.log_stat("belief_hidden_frac", belief_mask.mean().item(), t_env)
-            self.logger.log_stat("belief_visible_frac", visible_mask.mean().item(), t_env)
-            self.logger.log_stat("belief_future_hidden_frac", future_mask.mean().item(), t_env)
-            self.logger.log_stat("belief_gate_mean", belief_gate[:, :-1].mean().item(), t_env)
-            self.logger.log_stat("belief_delta_abs_mean", student_contrib.detach().abs().mean().item(), t_env)
-            self.logger.log_stat("belief_oracle_delta_abs_mean", oracle_contrib.detach().abs().mean().item(), t_env)
-            self.logger.log_stat("belief_confidence_mean", belief_confidence[:, :-1].mean().item(), t_env)
-            self.logger.log_stat("belief_correction_alpha_mean", correction_alpha[:, :-1].mean().item(), t_env)
-            self.logger.log_stat("base_q_abs_mean", base_q[:, :-1].detach().abs().mean().item(), t_env)
+            self.logger.log_stat("belief_hidden_frac", belief_hidden_frac.item(), t_env)
+            self.logger.log_stat("belief_visible_frac", belief_visible_frac.item(), t_env)
+            self.logger.log_stat("belief_future_hidden_frac", belief_future_hidden_frac.item(), t_env)
+            self.logger.log_stat("belief_gate_mean", belief_gate_mean.item(), t_env)
+            self.logger.log_stat("belief_delta_abs_mean", belief_delta_abs_mean.item(), t_env)
+            self.logger.log_stat("belief_oracle_delta_abs_mean", belief_oracle_delta_abs_mean.item(), t_env)
+            self.logger.log_stat("belief_confidence_mean", belief_confidence_mean.item(), t_env)
+            self.logger.log_stat("belief_correction_alpha_mean", belief_correction_alpha_mean.item(), t_env)
+            self.logger.log_stat("base_q_abs_mean", base_q_abs_mean.item(), t_env)
             self.logger.log_stat("grad_norm", grad_norm, t_env)
             mask_elems = q_mask.sum().item()
             self.logger.log_stat("td_error_abs", masked_td_error.abs().sum().item() / mask_elems, t_env)
